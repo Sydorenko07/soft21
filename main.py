@@ -114,7 +114,12 @@ async def save_processed(processed: set[str]) -> None:
 
 
 async def text_in(locator: Locator, selector: str) -> str:
-    return await locator.locator(selector).first.inner_text()
+    target = locator.locator(selector).first
+    # ``inner_text()`` otherwise waits Playwright's default 30 seconds when a
+    # header/empty row does not contain the requested cell.
+    if await target.count() == 0:
+        raise ValueError(f"Селектор не знайдено: {selector}")
+    return await target.inner_text(timeout=1_000)
 
 
 async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
