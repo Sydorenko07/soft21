@@ -126,7 +126,7 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
     """Read the UAH amount even when Paychain changes inner-cell markup."""
     try:
         cell_texts = await element.evaluate(
-            "el => Array.from(el.querySelectorAll('td')).map(td => td.textContent || '')"
+            "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')"
         )
     except Exception:
         cell_texts = await element.locator("td").all_text_contents()
@@ -136,10 +136,11 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
     # generated classes and text selectors change.
     amount_cell_text = cell_texts[2] if len(cell_texts) > 2 else ""
     if amount_cell_text:
-        if re.search(r"\bUAH\b", amount_cell_text, flags=re.IGNORECASE):
-            number = re.search(r"[0-9][0-9 \t.,]*", amount_cell_text)
-            if number:
-                return parse_amount(number.group(0)), "UAH"
+        # This cell is the fiat payout column on the Paychain pay-out page.
+        # Parse it even if the UI omits the literal ``UAH`` in textContent.
+        number = re.search(r"[0-9][0-9 \t.,]*", amount_cell_text)
+        if number:
+            return parse_amount(number.group(0)), "UAH"
 
     # Reading the individual cells is more reliable than a CSS text selector:
     # the visible cell may contain line breaks or Angular-generated wrappers.
@@ -156,9 +157,7 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
     if match:
         return parse_amount(match.group(1)), "UAH"
 
-    amount_text = await text_in(element, settings.amount_selector)
-    currency_text = await text_in(element, settings.currency_selector)
-    return parse_amount(amount_text), normalize_currency(currency_text)
+    raise ValueError("У рядку не знайдено суму в третій клітинці")
 
 
 async def select_thirty_rows(page: Page) -> None:
