@@ -137,8 +137,10 @@ async def find_offer_elements(page: Page, settings: Settings, timeout_ms: int = 
     """Wait for Paychain's asynchronously rendered offer rows."""
     selectors = tuple(dict.fromkeys((
         settings.offer_selector,
+        "tbody tr",
         "tr[role='row']:has(td:has-text('UAH'))",
         "tr:has(td:has-text('UAH'))",
+        "tr[role='row']",
     )))
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
@@ -147,7 +149,7 @@ async def find_offer_elements(page: Page, settings: Settings, timeout_ms: int = 
             if elements:
                 return elements
         # Stop early when Paychain explicitly renders the empty-table marker.
-        if await page.locator("app-empty-table").count():
+        if await page.locator("app-empty-table:visible").count():
             return []
         if time.monotonic() >= deadline:
             return []
@@ -262,9 +264,11 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
             activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offer_elements))
             if not offer_elements:
                 row_count = await page.locator("tr").count()
+                tbody_count = await page.locator("tbody tr").count()
+                role_row_count = await page.locator("[role='row']").count()
                 activity_log.info(
-                    "Вікно %d | СТОРІНКА | url=%s | title=%s | tr=%d",
-                    window_id, page.url, await page.title(), row_count,
+                    "Вікно %d | СТОРІНКА | url=%s | title=%s | tr=%d | tbody_tr=%d | role_row=%d",
+                    window_id, page.url, await page.title(), row_count, tbody_count, role_row_count,
                 )
             current_offers = []
 
@@ -292,7 +296,11 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                         status=status,
                         element=element
                     ))
-                except Exception:
+                except Exception as error:
+                    activity_log.info(
+                        "Вікно %d | РЯДОК НЕ РОЗІБРАНО | %s",
+                        window_id, type(error).__name__,
+                    )
                     continue
 
             for offer in current_offers:
