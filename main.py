@@ -498,13 +498,9 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     if offer.offer_id in _processed_cache:
                         continue
 
-                # Подвійна перевірка суми
-                verified_amount = await verify_amount_twice(page, offer, settings)
-                if verified_amount is None:
-                    activity_log.info("Вікно %d | ПРОПУЩЕНО | оффер %s | сума змінилася", window_id, offer.offer_id[:8])
-                    continue
-
-                offer = replace(offer, amount=verified_amount)
+                # Після першого успішного читання рядка одразу перевіряємо
+                # поріг і переходимо до прийняття. Друга перевірка тут не
+                # використовується, щоб не втрачати швидкі офери.
                 reasons: list[str] = []
 
                 if offer.currency != "UAH":
