@@ -18,7 +18,7 @@ if (-not (Test-Path $runAgent)) {
     @'
 @echo off
 cd /d "%~dp0.."
-start "Paychain Control Agent" /min ".venv\Scripts\python.exe" "telegram_app\agent.py"
+start "Paychain Control Agent" /min ".venv\Scripts\pythonw.exe" "telegram_app\agent.py"
 exit /b 0
 '@ | Set-Content -LiteralPath $runAgent -Encoding ascii
 }
