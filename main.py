@@ -124,6 +124,17 @@ async def text_in(locator: Locator, selector: str) -> str:
 
 async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
     """Read the UAH amount even when Paychain changes inner-cell markup."""
+    # In the Paychain payout table the third data cell is the fiat amount
+    # (the column labelled ``К отправке``).  It remains stable even when the
+    # generated classes and text selectors change.
+    amount_cell = element.locator("td").nth(2)
+    if await amount_cell.count():
+        amount_cell_text = await amount_cell.inner_text(timeout=1_000)
+        if re.search(r"\bUAH\b", amount_cell_text, flags=re.IGNORECASE):
+            number = re.search(r"[0-9][0-9 \t.,]*", amount_cell_text)
+            if number:
+                return parse_amount(number.group(0)), "UAH"
+
     # Reading the individual cells is more reliable than a CSS text selector:
     # the visible cell may contain line breaks or Angular-generated wrappers.
     for cell_text in await element.locator("td").all_inner_texts():
