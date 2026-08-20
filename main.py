@@ -347,7 +347,15 @@ async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Set
         if settings.action_menu_button_selector:
             await offer.element.locator(settings.action_menu_button_selector).first.click(timeout=5_000)
 
-        accept_button = offer.element.locator(settings.accept_button_selector).first
+        accept_button = offer.element.locator(settings.accept_button_selector).first if settings.accept_button_selector else None
+        if accept_button is None or await accept_button.count() == 0:
+            # Keep the action row-scoped, but tolerate Paychain changing the
+            # generated PrimeNG attributes around the visible button.
+            accept_button = offer.element.get_by_role(
+                "button", name=re.compile(r"Принять|Подтвердить|Accept", re.IGNORECASE)
+            ).first
+        if await accept_button.count() == 0:
+            raise ValueError("Кнопка прийняття не знайдена в рядку")
 
         # Перший клік
         await accept_button.click(timeout=5_000)
