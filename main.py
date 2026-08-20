@@ -357,17 +357,41 @@ async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Set
         if await accept_button.count() == 0:
             raise ValueError("Кнопка прийняття не знайдена в рядку")
 
-        # Перший клік
-        await accept_button.click(timeout=5_000)
+        # Collect the POST result without waiting for it between the two
+        # clicks.  This keeps the required 50 ms double-click while allowing
+        # the agent to report a successful API response to Telegram.
+        accept_statuses: list[int] = []
 
-        # Пауза 50 мс – завжди, незалежно від відповіді
-        await page.wait_for_timeout(50)
+        def capture_accept_response(response) -> None:
+            try:
+                if response.request.method == "POST" and response.url.rstrip("/").endswith("/accept"):
+                    accept_statuses.append(response.status)
+            except Exception:
+                pass
 
-        # Другий клік (ігноруємо помилки, якщо кнопка зникла)
+        page.on("response", capture_accept_response)
+
         try:
-            await accept_button.click(timeout=2_000)
-        except Exception:
-            pass
+            # Перший клік
+            await accept_button.click(timeout=5_000)
+
+            # Пауза 50 мс – завжди, незалежно від відповіді
+            await page.wait_for_timeout(50)
+
+            # Другий клік (ігноруємо помилки, якщо кнопка вже зникла)
+            try:
+                await accept_button.click(timeout=2_000)
+            except Exception:
+                pass
+
+            # Дати браузеру отримати відповідь, але не блокувати моніторинг.
+            await page.wait_for_timeout(500)
+        finally:
+            page.remove_listener("response", capture_accept_response)
+
+        if any(200 <= status < 300 for status in accept_statuses):
+            activity_log.info("ПРИЙНЯТО | оффер %s | %s %s", offer.offer_id, offer.amount, offer.currency)
+            return True
 
         # Невелика пауза для оновлення DOM
         await page.wait_for_timeout(300)
