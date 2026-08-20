@@ -124,6 +124,14 @@ async def text_in(locator: Locator, selector: str) -> str:
 
 async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
     """Read the UAH amount even when Paychain changes inner-cell markup."""
+    # Reading the individual cells is more reliable than a CSS text selector:
+    # the visible cell may contain line breaks or Angular-generated wrappers.
+    for cell_text in await element.locator("td").all_inner_texts():
+        if re.search(r"\bUAH\b", cell_text, flags=re.IGNORECASE):
+            number = re.search(r"[0-9][0-9 \t.,]*", cell_text)
+            if number:
+                return parse_amount(number.group(0)), "UAH"
+
     row_text = await element.inner_text()
     # Current Paychain rows contain text such as ``UAH 1717.60``.  Prefer
     # this stable visible text before relying on a generated Angular selector.
@@ -315,8 +323,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     ))
                 except Exception as error:
                     activity_log.info(
-                        "Вікно %d | РЯДОК НЕ РОЗІБРАНО | %s",
-                        window_id, type(error).__name__,
+                        "Вікно %d | РЯДОК НЕ РОЗІБРАНО | %s | %s",
+                        window_id, type(error).__name__, str(error)[:120],
                     )
                     continue
 
