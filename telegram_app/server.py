@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
 import sqlite3
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ from urllib.parse import parse_qsl
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -32,6 +34,7 @@ load_dotenv(ROOT / "settings.env")
 DB_PATH = Path(os.environ.get("DATABASE_PATH", ROOT / "control.sqlite3"))
 WEB_DIR = ROOT / "webapp"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+BOT_INTERNAL_TOKEN = os.environ.get("BOT_INTERNAL_TOKEN", "")
 DEV_USER_ID = os.environ.get("DEV_TELEGRAM_USER_ID")
 active_agents: dict[str, WebSocket] = {}
 
@@ -51,12 +54,16 @@ def setup_db() -> None:
                 owner_id TEXT NOT NULL,
                 token_hash TEXT NOT NULL,
                 threshold TEXT NOT NULL DEFAULT '5000',
+                refresh_seconds TEXT NOT NULL DEFAULT '2',
                 running INTEGER NOT NULL DEFAULT 0,
                 connected INTEGER NOT NULL DEFAULT 0,
                 last_status TEXT NOT NULL DEFAULT 'Не підключено',
                 updated_at INTEGER NOT NULL
             )"""
         )
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(agents)")}
+        if "refresh_seconds" not in columns:
+            connection.execute("ALTER TABLE agents ADD COLUMN refresh_seconds TEXT NOT NULL DEFAULT '2'")
 
 
 def validate_init_data(init_data: str) -> str:
@@ -102,6 +109,12 @@ def row_for(owner_id: str) -> sqlite3.Row | None:
 class Command(BaseModel):
     action: str
     threshold: float | None = Field(default=None, ge=0)
+    refresh_seconds: float | None = Field(default=2, ge=1)
+
+
+class BotCommand(BaseModel):
+    owner_id: str
+    action: str
 
 
 @asynccontextmanager
@@ -113,18 +126,48 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Paychain Telegram control", lifespan=lifespan)
 
 
+@app.get("/health", include_in_schema=False)
+async def health() -> dict[str, str]:
+    """Railway health check endpoint that does not require Telegram auth."""
+    return {"status": "ok"}
+
+
 @app.get("/api/state")
 async def state(owner_id: str = Depends(telegram_user)) -> dict[str, Any]:
     row = row_for(owner_id)
     if not row:
-        return {"paired": False, "connected": False, "running": False, "threshold": "5000", "status": "Потрібно підключити локальний агент."}
+        return {"paired": False, "connected": False, "running": False, "threshold": "5000", "refresh_seconds": "2", "status": "Потрібно підключити локальний агент."}
     return {
         "paired": True,
         "connected": bool(row["connected"]),
         "running": bool(row["running"]),
         "threshold": row["threshold"],
+        "refresh_seconds": row["refresh_seconds"],
         "status": row["last_status"],
     }
+
+
+@app.get("/download/agent")
+async def download_agent() -> Response:
+    """Return a clean, secret-free Windows agent bundle."""
+    project_root = ROOT.parent
+    files = (
+        "main.py", "config.example.json", "requirements.txt",
+        "install_agent.ps1", "install_agent.cmd", "START/install_agent.cmd",
+        "telegram_app/__init__.py", "telegram_app/agent.py",
+        "telegram_app/agent-config.example.json",
+    )
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for relative in files:
+            path = project_root / relative
+            if path.is_file():
+                bundle.write(path, relative)
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=paychain-agent.zip"},
+    )
 
 
 @app.post("/api/pair")
@@ -141,24 +184,53 @@ async def pair(owner_id: str = Depends(telegram_user)) -> dict[str, str]:
 
 @app.post("/api/command")
 async def command(payload: Command, owner_id: str = Depends(telegram_user)) -> dict[str, str]:
+    return await dispatch_command(payload, owner_id)
+
+
+async def dispatch_command(payload: Command, owner_id: str) -> dict[str, str]:
     row = row_for(owner_id)
     if not row:
         raise HTTPException(409, "Спершу підключіть локальний агент.")
-    if payload.action not in {"start", "stop", "set_threshold"}:
+    if payload.action not in {"start", "open_login", "stop", "set_threshold", "disconnect"}:
         raise HTTPException(400, "Невідома команда.")
-    if payload.action in {"start", "set_threshold"} and payload.threshold is None:
+    if payload.action in {"start", "open_login", "set_threshold"} and payload.threshold is None:
         raise HTTPException(400, "Вкажіть суму.")
+    refresh_seconds = payload.refresh_seconds or 2
     message: dict[str, Any] = {"type": "command", "action": payload.action}
     if payload.threshold is not None:
         message["threshold"] = str(payload.threshold)
+    message["refresh_seconds"] = str(refresh_seconds)
     socket = active_agents.get(row["agent_id"])
+    if payload.action == "disconnect":
+        if not socket:
+            raise HTTPException(409, "Спочатку підключіть локальний агент, щоб видалити вхід на цьому ПК.")
+        if socket:
+            await socket.send_json(message)
+        with db() as connection:
+            connection.execute("DELETE FROM agents WHERE agent_id=?", (row["agent_id"],))
+        return {"ok": "true"}
     if not socket:
         raise HTTPException(409, "Локальний агент не підключений.")
     await socket.send_json(message)
     with db() as connection:
         if payload.threshold is not None:
-            connection.execute("UPDATE agents SET threshold=?, updated_at=? WHERE agent_id=?", (str(payload.threshold), int(time.time()), row["agent_id"]))
+            connection.execute("UPDATE agents SET threshold=?, refresh_seconds=?, updated_at=? WHERE agent_id=?", (str(payload.threshold), str(refresh_seconds), int(time.time()), row["agent_id"]))
     return {"ok": "true"}
+
+
+@app.post("/api/bot-command")
+async def bot_command(
+    payload: BotCommand,
+    x_bot_internal_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    """Accept commands from our Telegram bot without exposing user credentials."""
+    if not BOT_INTERNAL_TOKEN:
+        raise HTTPException(503, "BOT_INTERNAL_TOKEN не налаштовано на сервері.")
+    if not x_bot_internal_token or not hmac.compare_digest(x_bot_internal_token, BOT_INTERNAL_TOKEN):
+        raise HTTPException(403, "Некоректний внутрішній токен бота.")
+    if payload.action != "stop":
+        raise HTTPException(400, "Непідтримувана команда бота.")
+    return await dispatch_command(Command(action=payload.action), payload.owner_id)
 
 
 async def notify_telegram(owner_id: str, text: str) -> None:

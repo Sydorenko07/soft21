@@ -12,10 +12,14 @@
     <header><div class="mark">P</div><div><h1>Paychain Control</h1><p>Локальний агент</p></div></header>
     <section class="card"><span id="dot" class="dot"></span><strong id="status">Завантаження…</strong><small id="substatus"></small></section>
     <section class="card"><label for="threshold">Мінімальна сума, UAH</label><input id="threshold" type="number" min="0" step="0.01" value="5000"><p>Після запуску угоди від цієї суми включно підтверджуються автоматично.</p></section>
-    <button id="start" class="primary">Запустити</button><button id="stop" class="secondary">Зупинити</button>
+    <section class="card"><label for="refresh_seconds">Оновлення сторінки, сек</label><input id="refresh_seconds" type="number" min="1" step="0.1" value="2"><p>Мінімальний інтервал — 1 секунда.</p></section>
+    <button id="login" class="secondary">Відкрити Paychain для входу</button>
+    <button id="start" class="primary">Запустити алгоритм</button><button id="stop" class="secondary">Зупинити</button>
+    <a class="link" href="/download/agent">Встановити агент на цей ПК</a>
     <button id="pair" class="link">Підключити цей комп’ютер</button>
+    <button id="disconnect" class="danger" hidden>Відключити цей ПК</button>
     <pre id="credentials" hidden></pre>
   </main>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=20260819-session4"></script>
 </body>
 </html>

@@ -9,5 +9,6 @@ config.json
 storage_state.json
 processed_offers.json
 .browser-profile/
+paychain-control-project-*.zip
 .start_monitoring.signal
 logs/

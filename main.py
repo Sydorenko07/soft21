@@ -1,10 +1,3 @@
-"""Monitor Paychain offers with a visible Playwright browser.
-
-Log in manually on the first run.  The default is dry-run: qualifying offers
-are logged but are never accepted.  Use --auto-accept only after testing the
-selectors in the account you are authorized to operate.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -13,20 +6,23 @@ import json
 import logging
 import re
 import sys
+import time
 from hashlib import sha256
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
 
-from playwright.async_api import BrowserContext, Locator, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
-
+from playwright.async_api import Locator, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 ROOT = Path(__file__).parent
-STATE_FILE = ROOT / "storage_state.json"
+PROFILE_DIR = ROOT / ".browser-profile"
 PROCESSED_FILE = ROOT / "processed_offers.json"
 LOG_DIR = ROOT / "logs"
 activity_log = logging.getLogger("activity")
+
+# Спільний кеш оброблених оферів та замок для безпечного запису
+_processed_cache: set[str] = set()
+_processed_lock = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -80,7 +76,6 @@ def load_settings(config_path: Path) -> Settings:
 
 
 def parse_amount(raw: str) -> Decimal:
-    """Parse strings such as '5 001,50 грн' without using floating point."""
     cleaned = raw.replace("\u00a0", " ").replace(" ", "")
     cleaned = re.sub(r"[^0-9,.-]", "", cleaned).replace(",", ".")
     if cleaned.count(".") > 1:
@@ -91,174 +86,287 @@ def parse_amount(raw: str) -> Decimal:
         raise ValueError(f"Не вдалося розібрати суму: {raw!r}") from error
 
 
-def load_processed() -> set[str]:
+def normalize_currency(raw: str) -> str:
+    match = re.search(r"\b(UAH|USD|EUR|USDT)\b", raw.upper())
+    return match.group(1) if match else raw.strip().upper()
+
+
+async def load_processed() -> set[str]:
+    """Завантажує список оброблених оферів у кеш."""
+    global _processed_cache
+    if _processed_cache:
+        return _processed_cache.copy()
     if not PROCESSED_FILE.exists():
         return set()
     try:
         data = json.loads(PROCESSED_FILE.read_text(encoding="utf-8"))
-        return set(map(str, data))
+        _processed_cache = set(data)
+        return _processed_cache.copy()
     except (OSError, json.JSONDecodeError):
-        logging.warning("Не вдалося прочитати processed_offers.json; починаю з порожнього журналу.")
         return set()
 
 
-def save_processed(processed: set[str]) -> None:
-    # Keep the file compact while protecting against accidental endless growth.
-    PROCESSED_FILE.write_text(json.dumps(sorted(processed)[-5000:], ensure_ascii=False, indent=2), encoding="utf-8")
+async def save_processed(processed: set[str]) -> None:
+    """Безпечно зберігає список оброблених оферів (із замком)."""
+    async with _processed_lock:
+        _processed_cache.update(processed)
+        PROCESSED_FILE.write_text(json.dumps(sorted(_processed_cache), indent=2), encoding="utf-8")
 
 
-async def text_in(offer: Locator, selector: str) -> str:
-    target = offer.locator(selector).first
-    return (await target.inner_text()).strip()
+async def text_in(locator: Locator, selector: str) -> str:
+    return await locator.locator(selector).first.inner_text()
 
 
-def parse_currency(raw: str) -> str:
-    match = re.search(r"\b([A-Z]{3,5})\b", raw.upper())
-    if not match:
-        raise ValueError(f"Не вдалося визначити валюту: {raw!r}")
-    return match.group(1)
+async def select_thirty_rows(page: Page) -> None:
+    """Set Paychain's paginator to show 30 offers when the control is present."""
+    dropdown = page.locator("p-select.p-paginator-rpp-dropdown").first
+    try:
+        await dropdown.wait_for(state="visible", timeout=10_000)
+    except PlaywrightTimeoutError:
+        return
+    label = dropdown.locator("[role='combobox']").first
+    if (await label.inner_text()).strip() == "30":
+        return
+    await dropdown.locator("[role='button'][aria-label='dropdown trigger']").click(timeout=5_000)
+    option = page.locator("[role='option']").filter(has_text=re.compile(r"^\s*30\s*$")).last
+    await option.click(timeout=5_000)
+    await page.wait_for_timeout(300)
 
 
-async def scan_offers(page: Page, settings: Settings) -> list[Offer]:
-    cards = page.locator(settings.offer_selector)
-    count = await cards.count()
-    offers: list[Offer] = []
-    for index in range(count):
-        card = cards.nth(index)
-        offer_id = await card.get_attribute(settings.offer_id_attribute) if settings.offer_id_attribute else None
-        if not offer_id and settings.offer_key_selector:
-            # The page fragment does not expose offer ID.  Hash a local stable identifier;
-            # its source value is never logged or saved in plain text.
-            key = await text_in(card, settings.offer_key_selector)
-            offer_id = sha256(key.encode("utf-8")).hexdigest()
-        if not offer_id:
-            key = await card.inner_text()
-            offer_id = sha256(key.encode("utf-8")).hexdigest()
-        try:
-            offer = Offer(
-                offer_id=offer_id,
-                amount=parse_amount(await text_in(card, settings.amount_selector)),
-                currency=parse_currency(await text_in(card, settings.currency_selector)),
-                status=(
-                    (await text_in(card, settings.status_selector)).casefold()
-                    if settings.status_selector
-                    # In the table view an offer with this row-scoped direct action is actionable.
-                    else ("active" if await card.locator(settings.accept_button_selector).count() else "")
-                ),
-                element=card,
-            )
-            offers.append(offer)
-        except (PlaywrightTimeoutError, ValueError) as error:
-            logging.warning("Оффер %s пропущено: %s", offer_id, error)
-    return offers
+async def verify_amount_twice(page: Page, offer: Offer, settings: Settings) -> Decimal | None:
+    try:
+        await page.wait_for_timeout(100)
+        second_amount = parse_amount(await text_in(offer.element, settings.amount_selector))
+    except (PlaywrightTimeoutError, ValueError):
+        return None
+    if second_amount != offer.amount:
+        return None
+    return second_amount
 
 
-async def accept_offer(page: Page, offer: Offer, settings: Settings) -> bool:
-    if not settings.accept_button_selector:
-        logging.error("Не задано безпечний селектор кнопки Accept у межах картки. Автоприйняття вимкнено.")
-        return False
+async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Settings) -> bool:
+    """
+    Подвійний клік по кнопці з інтервалом 50 мс.
+    Після кліків перевіряє, чи зник офер або змінився статус.
+    """
     try:
         if settings.action_menu_button_selector:
             await offer.element.locator(settings.action_menu_button_selector).first.click(timeout=5_000)
-        # The confirmation control is scoped to this row.  Verify success from
-        # the API response instead of assuming the entire table row disappears.
-        button = offer.element.locator(settings.accept_button_selector).first
-        async with page.expect_response(
-            lambda response: response.request.method == "POST" and response.url.rstrip("/").endswith("/accept"),
-            timeout=8_000,
-        ) as response_info:
-            await button.click(timeout=5_000)
-        response = await response_info.value
-        if not 200 <= response.status < 300:
-            logging.error("Прийняття оффера %s повернуло HTTP %s.", offer.offer_id, response.status)
-            activity_log.info("ВІДХИЛЕНО API | оффер %s | %s %s | HTTP %s", offer.offer_id[:8], offer.amount, offer.currency, response.status)
-            return False
-        logging.info("Оффер %s прийнято.", offer.offer_id)
-        activity_log.info("ПРИЙНЯТО | оффер %s | %s %s", offer.offer_id[:8], offer.amount, offer.currency)
-        return True
+
+        accept_button = offer.element.locator(settings.accept_button_selector).first
+
+        # Перший клік
+        await accept_button.click(timeout=5_000)
+
+        # Пауза 50 мс – завжди, незалежно від відповіді
+        await page.wait_for_timeout(50)
+
+        # Другий клік (ігноруємо помилки, якщо кнопка зникла)
+        try:
+            await accept_button.click(timeout=2_000)
+        except Exception:
+            pass
+
+        # Невелика пауза для оновлення DOM
+        await page.wait_for_timeout(300)
+
+        # Перевіряємо, чи офер ще існує або чи змінився статус
+        try:
+            if settings.status_selector:
+                new_status = (await text_in(offer.element, settings.status_selector)).strip().casefold()
+                if new_status not in settings.active_statuses:
+                    activity_log.info("ПРИЙНЯТО | оффер %s | %s %s", offer.offer_id, offer.amount, offer.currency)
+                    return True
+            else:
+                # Якщо селектор статусу не задано, перевіряємо, чи зник елемент
+                if await offer.element.count() == 0:
+                    activity_log.info("ПРИЙНЯТО | оффер %s | %s %s", offer.offer_id, offer.amount, offer.currency)
+                    return True
+        except Exception:
+            # Якщо елемент зник або сталася помилка – вважаємо, що прийнято
+            if await offer.element.count() == 0:
+                activity_log.info("ПРИЙНЯТО | оффер %s | %s %s", offer.offer_id, offer.amount, offer.currency)
+                return True
+
+        activity_log.warning("Офер %s залишився активним після подвійного кліку.", offer.offer_id[:8])
+        return False
+
     except PlaywrightTimeoutError:
-        logging.error("Після натискання результат для оффера %s не підтверджено.", offer.offer_id)
-        activity_log.info("НЕ ПІДТВЕРДЖЕНО | оффер %s | %s %s", offer.offer_id[:8], offer.amount, offer.currency)
+        logging.warning("Таймаут під час кліку на офер %s", offer.offer_id[:8])
+        return False
+    except Exception as e:
+        logging.error("Помилка при прийнятті офера %s: %s", offer.offer_id[:8], e)
         return False
 
 
-async def run(settings: Settings, auto_accept: bool, start_signal: Path | None = None) -> None:
-    processed = load_processed()
-    seen_in_dry_run: set[str] = set()
-    reported: set[str] = set()
-    last_empty_report = 0.0
-    async with async_playwright() as playwright:
-        context: BrowserContext = await playwright.chromium.launch_persistent_context(
-            str(ROOT / ".browser-profile"), headless=False
-        )
-        page = context.pages[0] if context.pages else await context.new_page()
-        await page.goto(settings.offers_url, wait_until="domcontentloaded")
-        logging.info("Увійдіть у свій обліковий запис у відкритому браузері. Оновлення вимкнено, доки ви не підтвердите готовність.")
-        if start_signal:
-            logging.info("Очікую натискання кнопки «Почати моніторинг» у вікні керування.")
-            while not start_signal.exists():
-                await asyncio.sleep(0.2)
-            start_signal.unlink(missing_ok=True)
-        else:
-            await asyncio.to_thread(input, "\nПісля входу й відкриття сторінки офферів натисніть Enter тут, щоб почати моніторинг: ")
-        logging.info("Моніторинг запущено.")
-        activity_log.info("СТАРТ | поріг: %s UAH | авто-підтвердження: %s", settings.minimum_amount_uah, "так" if auto_accept else "ні")
+async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path | None,
+                        page: Page, window_id: int) -> None:
+    """Один екземпляр моніторингу на окремій сторінці."""
+    processed = await load_processed()
+    reported = set()
+    seen_in_dry_run = set()
 
-        while True:
-            started = asyncio.get_running_loop().time()
+    await page.goto(settings.offers_url)
+    try:
+        await select_thirty_rows(page)
+    except PlaywrightTimeoutError:
+        logging.warning("Не вдалося вибрати 30 оферів на сторінці")
+
+    if start_signal:
+        while not start_signal.exists():
+            await asyncio.sleep(0.5)
+
+    while True:
+        iteration_start = time.monotonic()
+
+        try:
+            if page.is_closed():
+                logging.warning("Вікно %d: сторінка закрита", window_id)
+                break
+
+            await page.reload(timeout=10_000)
+            await page.wait_for_load_state("load")
+
+            # Paychain renders the table asynchronously after the initial
+            # page load.  Give Angular a short window to insert either an
+            # offer row or the empty-table placeholder before scanning.
             try:
-                if page.url != settings.offers_url:
-                    await page.goto(settings.offers_url, wait_until="domcontentloaded")
-                else:
-                    await page.reload(wait_until="domcontentloaded")
-
-                # The page is an Angular app; its cards often render after DOMContentLoaded.
-                await page.wait_for_timeout(800)
-                current_offers = await scan_offers(page, settings)
-                if not current_offers:
-                    now = asyncio.get_running_loop().time()
-                    if now - last_empty_report >= 30:
-                        activity_log.info("СКАНУВАННЯ | карток офферів не знайдено на сторінці.")
-                        last_empty_report = now
-
-                for offer in current_offers:
-                    if offer.offer_id in processed:
-                        continue
-                    reasons: list[str] = []
-                    if offer.currency != "UAH":
-                        reasons.append(f"валюта {offer.currency}")
-                    if offer.status not in settings.active_statuses:
-                        reasons.append(f"статус {offer.status}")
-                    if offer.amount < settings.minimum_amount_uah:
-                        reasons.append(f"сума {offer.amount} < порога {settings.minimum_amount_uah}")
-                    qualifies = (
-                        offer.currency == "UAH"
-                        and offer.status in settings.active_statuses
-                        and offer.amount >= settings.minimum_amount_uah
-                    )
-                    if not qualifies:
-                        if offer.offer_id not in reported:
-                            logging.info("Оффер %s: пропущено (%s).", offer.offer_id[:8], "; ".join(reasons))
-                            activity_log.info("ПРОПУЩЕНО | оффер %s | %s %s | %s", offer.offer_id[:8], offer.amount, offer.currency, "; ".join(reasons))
-                            reported.add(offer.offer_id)
-                        continue
-                    logging.warning("Новий оффер: %s — %s %s (%s)", offer.offer_id, offer.amount, offer.currency, offer.status)
-                    if auto_accept:
-                        if await accept_offer(page, offer, settings):
-                            processed.add(offer.offer_id)
-                            save_processed(processed)
-                    else:
-                        if offer.offer_id not in seen_in_dry_run:
-                            logging.warning("DRY-RUN: оффер не прийнято. Запустіть з --auto-accept лише після перевірки.")
-                            activity_log.info("ПІДХОДИТЬ, АЛЕ НЕ ПРИЙНЯТО | оффер %s | %s %s | тестовий режим", offer.offer_id[:8], offer.amount, offer.currency)
-                            seen_in_dry_run.add(offer.offer_id)
+                # Do not wait for any generic table row: the header is also
+                # a role="row" and would release the wait too early.  Wait
+                # specifically for an offer row containing the currency, or
+                # for the explicit empty-table placeholder.
+                await page.locator(
+                    f"{settings.offer_selector}, app-empty-table"
+                ).first.wait_for(state="visible", timeout=1000)
             except PlaywrightTimeoutError:
-                logging.warning("Сторінка не встигла завантажитися; повторю через 2 секунди.")
-            except Exception:
-                logging.exception("Помилка циклу; продовжую моніторинг.")
+                # The page may still be loading or may contain neither
+                # element; the normal scan below will record the result.
+                pass
 
-            elapsed = asyncio.get_running_loop().time() - started
-            await asyncio.sleep(max(0, settings.refresh_seconds - elapsed))
+            offer_elements = await page.locator(settings.offer_selector).all()
+            # Paychain sometimes renders rows without the mdc-data-table row
+            # class, while keeping the semantic role="row" attribute.
+            if not offer_elements:
+                fallback_selector = "tr[role='row']:has(td:has-text('UAH'))"
+                if settings.offer_selector != fallback_selector:
+                    offer_elements = await page.locator(fallback_selector).all()
+            activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offer_elements))
+            current_offers = []
+
+            for element in offer_elements:
+                try:
+                    if settings.offer_id_attribute:
+                        offer_id = await element.get_attribute(settings.offer_id_attribute)
+                    else:
+                        text = await element.inner_text()
+                        offer_id = sha256(text.encode()).hexdigest()
+
+                    amount_text = await text_in(element, settings.amount_selector)
+                    amount = parse_amount(amount_text)
+                    currency = normalize_currency(await text_in(element, settings.currency_selector))
+
+                    if settings.status_selector:
+                        status = (await text_in(element, settings.status_selector)).strip().casefold()
+                    else:
+                        status = "active"
+
+                    current_offers.append(Offer(
+                        offer_id=offer_id,
+                        amount=amount,
+                        currency=currency,
+                        status=status,
+                        element=element
+                    ))
+                except Exception:
+                    continue
+
+            for offer in current_offers:
+                # Перевіряємо спільний кеш (з замком)
+                async with _processed_lock:
+                    if offer.offer_id in _processed_cache:
+                        continue
+
+                # Подвійна перевірка суми
+                verified_amount = await verify_amount_twice(page, offer, settings)
+                if verified_amount is None:
+                    activity_log.info("Вікно %d | ПРОПУЩЕНО | оффер %s | сума змінилася", window_id, offer.offer_id[:8])
+                    continue
+
+                offer = replace(offer, amount=verified_amount)
+                reasons: list[str] = []
+
+                if offer.currency != "UAH":
+                    reasons.append(f"валюта {offer.currency}")
+                if offer.status not in settings.active_statuses:
+                    reasons.append(f"статус {offer.status}")
+                if offer.amount < settings.minimum_amount_uah:
+                    reasons.append(f"сума {offer.amount} < порога {settings.minimum_amount_uah}")
+
+                qualifies = (
+                    offer.currency == "UAH"
+                    and offer.status in settings.active_statuses
+                    and offer.amount >= settings.minimum_amount_uah
+                )
+
+                if not qualifies:
+                    if offer.offer_id not in reported:
+                        logging.info("Вікно %d | Оффер %s: пропущено (%s).", window_id, offer.offer_id[:8], "; ".join(reasons))
+                        activity_log.info("Вікно %d | ПРОПУЩЕНО | оффер %s | %s %s | %s", window_id, offer.offer_id[:8], offer.amount, offer.currency, "; ".join(reasons))
+                        reported.add(offer.offer_id)
+                    continue
+
+                logging.warning("Вікно %d | НОВИЙ ОФФЕР: %s — %s %s (%s)", window_id, offer.offer_id[:8], offer.amount, offer.currency, offer.status)
+
+                if auto_accept:
+                    # Ще раз перевіряємо, чи не прийняв офер інший контекст (з замком)
+                    async with _processed_lock:
+                        if offer.offer_id in _processed_cache:
+                            logging.info("Вікно %d | Офер %s вже прийнято іншим вікном, пропускаю.", window_id, offer.offer_id[:8])
+                            continue
+
+                    # Приймаємо
+                    if await accept_offer_with_double_click(page, offer, settings):
+                        await save_processed({offer.offer_id})
+                        processed.add(offer.offer_id)
+                else:
+                    if offer.offer_id not in seen_in_dry_run:
+                        logging.warning("Вікно %d | DRY-RUN: оффер не прийнято.", window_id)
+                        activity_log.info("Вікно %d | ПІДХОДИТЬ, АЛЕ НЕ ПРИЙНЯТО | оффер %s | %s %s | тестовий режим", window_id, offer.offer_id[:8], offer.amount, offer.currency)
+                        seen_in_dry_run.add(offer.offer_id)
+
+        except PlaywrightTimeoutError:
+            logging.warning("Вікно %d: таймаут", window_id)
+        except Exception:
+            logging.exception("Вікно %d: помилка циклу", window_id)
+
+        elapsed = time.monotonic() - iteration_start
+        sleep_time = max(0, settings.refresh_seconds - elapsed)
+        await asyncio.sleep(sleep_time)
+
+
+async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
+              minimized: bool, windows: int) -> None:
+    """Запускає один браузер з кількома сторінками (вікнами)."""
+    # Завантажуємо кеш оброблених оферів перед запуском
+    await load_processed()
+
+    async with async_playwright() as p:
+        launch_args = ["--start-minimized"] if minimized else []
+        context = await p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=False, args=launch_args
+        )
+
+        # Створюємо окремі сторінки для кожного вікна
+        tasks = []
+        for i in range(windows):
+            page = await context.new_page()
+            task = asyncio.create_task(
+                run_instance(settings, auto_accept, start_signal, page, i + 1)
+            )
+            tasks.append(task)
+
+        # Чекаємо завершення всіх задач (вони працюють вічно)
+        await asyncio.gather(*tasks)
 
 
 def configure_logging() -> None:
@@ -279,19 +387,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Paychain offer monitor")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--auto-accept", action="store_true", help="Приймати оффери після успішного dry-run тесту")
-    parser.add_argument("--minimum-amount", type=Decimal, help="Перевизначити мінімальну суму UAH із config.json")
+    parser.add_argument("--minimum-amount", type=Decimal, help="Перевизначити мінімальну суму UAH")
+    parser.add_argument("--refresh-seconds", type=float, help="Інтервал оновлення сторінки в секундах")
+    parser.add_argument("--windows", type=int, default=1, help="Кількість одночасних вікон моніторингу (за замовчуванням 1)")
     parser.add_argument("--start-signal", type=Path, help="Файл-сигнал запуску для вікна керування")
+    parser.add_argument("--minimized", action="store_true", help="Запустити браузер мінімізованим")
     args = parser.parse_args()
+
     configure_logging()
     try:
         settings = load_settings(args.config)
         if args.minimum_amount is not None:
             settings = replace(settings, minimum_amount_uah=args.minimum_amount)
+        if args.refresh_seconds is not None:
+            settings = replace(settings, refresh_seconds=args.refresh_seconds)
         if settings.minimum_amount_uah < 0:
-            raise ValueError("minimum_amount не може бути від’ємним.")
+            raise ValueError("minimum_amount не може бути від'ємним.")
         if settings.refresh_seconds < 1:
             raise ValueError("refresh_seconds не може бути меншим за 1 секунду.")
-        asyncio.run(run(settings, args.auto_accept, args.start_signal))
+        if args.windows < 1:
+            raise ValueError("windows має бути >= 1")
+
+        asyncio.run(run(settings, args.auto_accept, args.start_signal, args.minimized, args.windows))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         logging.error("Конфігурація: %s", error)
         raise SystemExit(2) from error
