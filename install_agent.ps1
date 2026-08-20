@@ -19,7 +19,7 @@ if (-not (Test-Path $python)) {
             $pythonExecutable = Get-Command python3 -ErrorAction SilentlyContinue
         }
         if (-not $pythonExecutable) {
-            throw 'Python не знайдено. Встановіть Python з https://www.python.org/downloads/ і увімкніть Add Python to PATH.'
+            throw 'Python was not found. Install Python from https://www.python.org/downloads/ and enable Add Python to PATH.'
         }
         $pythonExecutable.Source
     }
