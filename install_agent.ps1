@@ -1,0 +1,26 @@
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$venv = Join-Path $root '.venv'
+$python = Join-Path $venv 'Scripts\python.exe'
+
+Write-Host 'Installing Paychain local agent...' -ForegroundColor Cyan
+if (-not (Test-Path $python)) {
+    py -3.12 -m venv $venv
+}
+& $python -m pip install --upgrade pip
+& $python -m pip install -r (Join-Path $root 'requirements.txt')
+& $python -m playwright install chromium
+
+$agent = Join-Path $root 'telegram_app\agent.py'
+$startup = [Environment]::GetFolderPath('Startup')
+$shortcutPath = Join-Path $startup 'Paychain Control Agent.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $python
+$shortcut.Arguments = ('"' + $agent + '"')
+$shortcut.WorkingDirectory = $root
+$shortcut.WindowStyle = 7
+$shortcut.Save()
+
+Start-Process -FilePath $python -ArgumentList ('"' + $agent + '"') -WorkingDirectory $root -WindowStyle Minimized
+Write-Host 'Agent installed and started. Pair the PC from the Telegram Mini App.' -ForegroundColor Green
