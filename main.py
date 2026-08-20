@@ -181,6 +181,93 @@ async def extract_offer_amount_and_currency(
     return parse_offer_cells(cell_texts)
 
 
+async def _scan_card_locator(cards: Locator, settings: Settings) -> list[Offer]:
+    """Read offers one row at a time, like the original working monitor.
+
+    Paychain replaces individual Angular rows while the table is rendering.
+    Reading a live row with ``count``/``nth`` is more reliable here than taking
+    a page-wide DOM snapshot: each amount is parsed from that row's third
+    ``td`` and the action button is checked in the same row.
+    """
+    count = await cards.count()
+    offers: list[Offer] = []
+    for index in range(count):
+        card = cards.nth(index)
+        try:
+            cell_texts = await card.locator("td").all_text_contents()
+            if len(cell_texts) < 3:
+                continue
+
+            # The Paychain payout table keeps the UAH amount in the third
+            # cell.  Fall back to the configured selectors only for a row
+            # whose generated markup differs from the normal table.
+            try:
+                amount, currency = parse_offer_cells(cell_texts)
+            except ValueError:
+                amount = None
+                currency = ""
+                selectors = [settings.amount_selector, "td:nth-child(3)", "td"]
+                for selector in dict.fromkeys(value for value in selectors if value):
+                    try:
+                        raw_amount = await text_in(card, selector)
+                        amount = parse_amount(raw_amount)
+                        currency = normalize_currency(raw_amount) or "UAH"
+                        break
+                    except (PlaywrightTimeoutError, ValueError):
+                        continue
+                if amount is None:
+                    raise ValueError("У рядку не знайдено суму")
+
+            offer_id = None
+            if settings.offer_id_attribute:
+                offer_id = await card.get_attribute(settings.offer_id_attribute)
+            if not offer_id and settings.offer_key_selector:
+                key = await text_in(card, settings.offer_key_selector)
+                offer_id = sha256(key.encode("utf-8")).hexdigest()
+            if not offer_id:
+                key = "\n".join(cell_texts).strip()
+                offer_id = sha256(key.encode("utf-8")).hexdigest()
+
+            if settings.status_selector:
+                status = (await text_in(card, settings.status_selector)).strip().casefold()
+            else:
+                accept_count = 0
+                if settings.accept_button_selector:
+                    accept_count = await card.locator(settings.accept_button_selector).count()
+                if not accept_count:
+                    accept_count = await card.get_by_role(
+                        "button", name=re.compile(r"Принять|Подтвердить|Accept", re.IGNORECASE)
+                    ).count()
+                status = "active" if accept_count else ""
+
+            if status:
+                offers.append(Offer(
+                    offer_id=str(offer_id),
+                    amount=amount,
+                    currency=currency,
+                    status=status,
+                    element=card,
+                ))
+        except (PlaywrightTimeoutError, ValueError) as error:
+            logging.warning("Оффер у рядку %d пропущено: %s", index + 1, error)
+    return offers
+
+
+async def scan_offers(page: Page, settings: Settings) -> list[Offer]:
+    """Scan live Paychain rows using the original per-row method."""
+    cards = page.locator(settings.offer_selector)
+    offers = await _scan_card_locator(cards, settings)
+    if offers:
+        return offers
+
+    # ``:has-text`` can briefly return no rows while Angular is replacing the
+    # table.  The table itself is stable, so retry with its body rows.
+    fallback = page.locator("tbody tr")
+    if await fallback.count() and settings.offer_selector != "tbody tr":
+        return await _scan_card_locator(fallback, settings)
+    return offers
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -241,20 +328,12 @@ async def find_offer_elements(
 
 
 async def verify_amount_twice(page: Page, offer: Offer, settings: Settings) -> Decimal | None:
+    """Read the same row a second time before clicking Accept."""
     try:
-        await page.wait_for_timeout(100)
-        row_locator = page.locator(settings.offer_selector)
-        snapshots = await row_locator.evaluate_all(
-            "rows => rows.map(row => Array.from(row.querySelectorAll('td')).map(td => td.innerText || td.textContent || ''))"
-        )
-        for snapshot in snapshots:
-            try:
-                second_amount, _ = parse_offer_cells(snapshot)
-            except ValueError:
-                continue
-            if second_amount == offer.amount:
-                return second_amount
-        return None
+        await page.wait_for_timeout(80)
+        cells = await offer.element.locator("td").all_text_contents()
+        second_amount, _ = parse_offer_cells(cells)
+        return second_amount if second_amount == offer.amount else None
     except (PlaywrightTimeoutError, ValueError):
         return None
 
@@ -347,14 +426,14 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                 logging.warning("Вікно %d: сторінка закрита", window_id)
                 break
 
-            await page.reload(timeout=10_000)
-            await page.wait_for_load_state("load")
+            await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            # Paychain renders rows asynchronously after DOMContentLoaded.
+            # The original monitor waited briefly, then scanned each row live.
+            await page.wait_for_timeout(800)
 
-            # Paychain renders the table asynchronously after reload. Poll
-            # for rows instead of reading the DOM only once.
-            offer_elements, row_snapshots = await find_offer_elements(page, settings)
-            activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offer_elements))
-            if not offer_elements:
+            current_offers = await scan_offers(page, settings)
+            activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(current_offers))
+            if not current_offers:
                 row_count = await page.locator("tr").count()
                 tbody_count = await page.locator("tbody tr").count()
                 role_row_count = await page.locator("[role='row']").count()
@@ -362,44 +441,6 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     "Вікно %d | СТОРІНКА | url=%s | title=%s | tr=%d | tbody_tr=%d | role_row=%d",
                     window_id, page.url, await page.title(), row_count, tbody_count, role_row_count,
                 )
-            current_offers = []
-
-            for row_index, element in enumerate(offer_elements):
-                try:
-                    if settings.offer_id_attribute:
-                        offer_id = await element.get_attribute(settings.offer_id_attribute)
-                    else:
-                        snapshot = row_snapshots[row_index] if row_index < len(row_snapshots) else []
-                        text = "\n".join(snapshot)
-                        if not text:
-                            text = await element.evaluate(
-                                "el => el.innerText || el.textContent || ''",
-                                timeout=1_000,
-                            )
-                        offer_id = sha256(text.encode()).hexdigest()
-
-                    snapshot = row_snapshots[row_index] if row_index < len(row_snapshots) else None
-                    amount, currency = await extract_offer_amount_and_currency(element, settings, snapshot)
-
-                    if settings.status_selector:
-                        status = (await text_in(element, settings.status_selector)).strip().casefold()
-                    else:
-                        status = "active"
-
-                    current_offers.append(Offer(
-                        offer_id=offer_id,
-                        amount=amount,
-                        currency=currency,
-                        status=status,
-                        element=element
-                    ))
-                except Exception as error:
-                    activity_log.info(
-                        "Вікно %d | РЯДОК НЕ РОЗІБРАНО | %s | %s",
-                        window_id, type(error).__name__, str(error)[:120],
-                    )
-                    continue
-
             for offer in current_offers:
                 # Перевіряємо спільний кеш (з замком)
                 async with _processed_lock:
@@ -476,10 +517,13 @@ async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
             str(PROFILE_DIR), headless=False, args=launch_args
         )
 
-        # Створюємо окремі сторінки для кожного вікна
+        # Використовуємо вже відкриту сторінку persistent-контексту для
+        # першого вікна.  Саме так працювала стара версія: не створюється
+        # зайва вкладка, а введений вручну Paychain-сеанс лишається тим самим.
+        existing_pages = [page for page in context.pages if not page.is_closed()]
         tasks = []
         for i in range(windows):
-            page = await context.new_page()
+            page = existing_pages[i] if i < len(existing_pages) else await context.new_page()
             task = asyncio.create_task(
                 run_instance(settings, auto_accept, start_signal, page, i + 1)
             )
