@@ -206,18 +206,15 @@ async def find_offer_elements(
     page: Page, settings: Settings, timeout_ms: int = 8_000
 ) -> tuple[list[Locator], list[list[str]]]:
     """Wait for Paychain's asynchronously rendered offer rows."""
-    selectors = tuple(dict.fromkeys((
-        settings.offer_selector,
-        "tr:has-text('UAH')",
-        "tbody tr",
-        "tr[role='row']:has(td:has-text('UAH'))",
-        "tr:has(td:has-text('UAH'))",
-        "tr[role='row']",
-    )))
+    row_locators = [
+        page.locator(settings.offer_selector),
+        page.locator("tr").filter(has_text=re.compile(r"\bUAH\b", re.IGNORECASE)),
+        page.locator("tbody tr"),
+        page.locator("tr[role='row']"),
+    ]
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
-        for selector in selectors:
-            row_locator = page.locator(selector)
+        for row_locator in row_locators:
             elements = await row_locator.all()
             if elements:
                 try:
