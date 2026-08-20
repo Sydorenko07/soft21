@@ -225,7 +225,15 @@ async def find_offer_elements(
                     )
                 except Exception:
                     snapshots = []
-                return elements, snapshots
+                # Angular creates empty <tr> nodes before filling their cells.
+                # Do not return those skeleton rows as real offers.
+                if any(
+                    len(snapshot) > 2 and re.search(r"[0-9]", snapshot[2])
+                    for snapshot in snapshots
+                ):
+                    return elements, snapshots
+                if time.monotonic() >= deadline:
+                    return [], []
         # Stop early when Paychain explicitly renders the empty-table marker.
         if await page.locator("app-empty-table:visible").count():
             return [], []
