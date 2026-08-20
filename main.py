@@ -117,6 +117,20 @@ async def text_in(locator: Locator, selector: str) -> str:
     return await locator.locator(selector).first.inner_text()
 
 
+async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
+    """Read the UAH amount even when Paychain changes inner-cell markup."""
+    row_text = await element.inner_text()
+    # Current Paychain rows contain text such as ``UAH 1717.60``.  Prefer
+    # this stable visible text before relying on a generated Angular selector.
+    match = re.search(r"\bUAH\s+([0-9][0-9 \t.,]*)", row_text, flags=re.IGNORECASE)
+    if match:
+        return parse_amount(match.group(1)), "UAH"
+
+    amount_text = await text_in(element, settings.amount_selector)
+    currency_text = await text_in(element, settings.currency_selector)
+    return parse_amount(amount_text), normalize_currency(currency_text)
+
+
 async def select_thirty_rows(page: Page) -> None:
     """Set Paychain's paginator to show 30 offers when the control is present."""
     dropdown = page.locator("p-select.p-paginator-rpp-dropdown").first
@@ -280,9 +294,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                         text = await element.inner_text()
                         offer_id = sha256(text.encode()).hexdigest()
 
-                    amount_text = await text_in(element, settings.amount_selector)
-                    amount = parse_amount(amount_text)
-                    currency = normalize_currency(await text_in(element, settings.currency_selector))
+                    amount, currency = await extract_offer_amount_and_currency(element, settings)
 
                     if settings.status_selector:
                         status = (await text_in(element, settings.status_selector)).strip().casefold()
