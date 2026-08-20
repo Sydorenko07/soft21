@@ -153,7 +153,7 @@ async def download_agent() -> Response:
     project_root = ROOT.parent
     files = (
         "main.py", "config.example.json", "requirements.txt",
-        "install_agent.ps1", "install_agent.cmd", "START/install_agent.cmd",
+        "install_agent.ps1", "install_agent.cmd", "START/install_agent.cmd", "START/run_agent.cmd",
         "telegram_app/__init__.py", "telegram_app/agent.py",
         "telegram_app/agent-config.example.json",
     )
