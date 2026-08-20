@@ -268,6 +268,24 @@ async def scan_offers(page: Page, settings: Settings) -> list[Offer]:
     return offers
 
 
+async def wait_for_offer_table(page: Page, timeout_ms: int = 8_000) -> None:
+    """Wait for Angular to attach the payout table after a reload.
+
+    ``domcontentloaded`` only means that the shell loaded.  Paychain then
+    requests the offers and creates ``tbody tr`` asynchronously, so scanning
+    immediately can legitimately see zero rows even while the browser is
+    about to display them.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if await page.locator("tbody tr").count():
+            return
+        # An explicitly rendered empty state is also a completed table load.
+        if await page.locator("app-empty-table:visible").count():
+            return
+        await page.wait_for_timeout(250)
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -462,6 +480,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
             # Paychain renders rows asynchronously after DOMContentLoaded.
             # The original monitor waited briefly, then scanned each row live.
             await page.wait_for_timeout(800)
+            await wait_for_offer_table(page)
 
             current_offers = await scan_offers(page, settings)
             activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(current_offers))
