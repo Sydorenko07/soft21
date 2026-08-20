@@ -34,8 +34,19 @@ class Agent:
         self.login_pending = False
         self.activity_position = ACTIVITY_LOG.stat().st_size if ACTIVITY_LOG.exists() else 0
 
+    def process_alive(self) -> bool:
+        """Return true only while the browser-monitor child is really alive."""
+        if self.process is None:
+            return False
+        if self.process.poll() is None:
+            return True
+        self.process = None
+        self.login_pending = False
+        SIGNAL_PATH.unlink(missing_ok=True)
+        return False
+
     def start(self, threshold: str, refresh_seconds: str = "2") -> None:
-        if self.process and self.process.poll() is None:
+        if self.process_alive():
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
             SIGNAL_PATH.write_text("start", encoding="utf-8")
@@ -52,7 +63,7 @@ class Agent:
         SIGNAL_PATH.write_text("start", encoding="utf-8")
 
     def open_login(self, threshold: str, refresh_seconds: str = "2") -> None:
-        if self.process and self.process.poll() is None:
+        if self.process_alive():
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
             SIGNAL_PATH.unlink(missing_ok=True)
@@ -94,7 +105,7 @@ class Agent:
 
     @property
     def running(self) -> bool:
-        return bool(self.process and self.process.poll() is None)
+        return self.process_alive()
 
     def new_activity(self) -> list[dict[str, str]]:
         if not ACTIVITY_LOG.exists():
