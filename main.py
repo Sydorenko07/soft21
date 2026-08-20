@@ -124,12 +124,18 @@ async def text_in(locator: Locator, selector: str) -> str:
 
 async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
     """Read the UAH amount even when Paychain changes inner-cell markup."""
+    try:
+        cell_texts = await element.evaluate(
+            "el => Array.from(el.querySelectorAll('td')).map(td => td.textContent || '')"
+        )
+    except Exception:
+        cell_texts = await element.locator("td").all_text_contents()
+
     # In the Paychain payout table the third data cell is the fiat amount
     # (the column labelled ``К отправке``).  It remains stable even when the
     # generated classes and text selectors change.
-    amount_cell = element.locator("td").nth(2)
-    if await amount_cell.count():
-        amount_cell_text = await amount_cell.inner_text(timeout=1_000)
+    amount_cell_text = cell_texts[2] if len(cell_texts) > 2 else ""
+    if amount_cell_text:
         if re.search(r"\bUAH\b", amount_cell_text, flags=re.IGNORECASE):
             number = re.search(r"[0-9][0-9 \t.,]*", amount_cell_text)
             if number:
@@ -137,13 +143,13 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
 
     # Reading the individual cells is more reliable than a CSS text selector:
     # the visible cell may contain line breaks or Angular-generated wrappers.
-    for cell_text in await element.locator("td").all_inner_texts():
+    for cell_text in cell_texts:
         if re.search(r"\bUAH\b", cell_text, flags=re.IGNORECASE):
             number = re.search(r"[0-9][0-9 \t.,]*", cell_text)
             if number:
                 return parse_amount(number.group(0)), "UAH"
 
-    row_text = await element.inner_text()
+    row_text = " ".join(cell_texts)
     # Current Paychain rows contain text such as ``UAH 1717.60``.  Prefer
     # this stable visible text before relying on a generated Angular selector.
     match = re.search(r"\bUAH\s+([0-9][0-9 \t.,]*)", row_text, flags=re.IGNORECASE)
@@ -197,7 +203,7 @@ async def find_offer_elements(page: Page, settings: Settings, timeout_ms: int = 
 async def verify_amount_twice(page: Page, offer: Offer, settings: Settings) -> Decimal | None:
     try:
         await page.wait_for_timeout(100)
-        second_amount = parse_amount(await text_in(offer.element, settings.amount_selector))
+        second_amount, _ = await extract_offer_amount_and_currency(offer.element, settings)
     except (PlaywrightTimeoutError, ValueError):
         return None
     if second_amount != offer.amount:
