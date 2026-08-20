@@ -208,6 +208,7 @@ async def find_offer_elements(
     """Wait for Paychain's asynchronously rendered offer rows."""
     selectors = tuple(dict.fromkeys((
         settings.offer_selector,
+        "tr:has-text('UAH')",
         "tbody tr",
         "tr[role='row']:has(td:has-text('UAH'))",
         "tr:has(td:has-text('UAH'))",

@@ -2,7 +2,7 @@
   "offers_url": "https://app.paychain.fund/pay-out",
   "refresh_seconds": 2,
   "minimum_amount_uah": 5000,
-  "offer_selector": "tbody tr",
+  "offer_selector": "tr:has-text('UAH')",
   "offer_id_attribute": "",
   "offer_key_selector": "",
   "amount_selector": "td:nth-child(3)",
