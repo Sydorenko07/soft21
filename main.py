@@ -345,17 +345,6 @@ async def find_offer_elements(
         await page.wait_for_timeout(250)
 
 
-async def verify_amount_twice(page: Page, offer: Offer, settings: Settings) -> Decimal | None:
-    """Read the same row a second time before clicking Accept."""
-    try:
-        await page.wait_for_timeout(80)
-        cells = await offer.element.locator("td").all_text_contents()
-        second_amount, _ = parse_offer_cells(cells)
-        return second_amount if second_amount == offer.amount else None
-    except (PlaywrightTimeoutError, ValueError):
-        return None
-
-
 async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Settings) -> bool:
     """
     Подвійний клік по кнопці з інтервалом 50 мс.
