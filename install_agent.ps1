@@ -2,10 +2,15 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venv = Join-Path $root '.venv'
 $python = Join-Path $venv 'Scripts\python.exe'
+$config = Join-Path $root 'config.json'
+$configExample = Join-Path $root 'config.example.json'
 
 Write-Host 'Installing Paychain local agent...' -ForegroundColor Cyan
 if (-not (Test-Path $python)) {
     py -3.12 -m venv $venv
+}
+if (-not (Test-Path $config) -and (Test-Path $configExample)) {
+    Copy-Item $configExample $config
 }
 & $python -m pip install --upgrade pip
 & $python -m pip install -r (Join-Path $root 'requirements.txt')
