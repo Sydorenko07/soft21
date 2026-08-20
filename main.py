@@ -122,29 +122,8 @@ async def text_in(locator: Locator, selector: str) -> str:
     return await target.inner_text(timeout=1_000)
 
 
-async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
-    """Read the UAH amount even when Paychain changes inner-cell markup."""
-    cell_texts: list[str] = []
-    # Angular can replace the row node while the table timer is updating.
-    # Re-read the same locator briefly so a transient detached node is not
-    # treated as a malformed offer.
-    for _ in range(5):
-        try:
-            cell_texts = await element.evaluate(
-                "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')",
-                timeout=300,
-            )
-            if len(cell_texts) >= 3:
-                break
-        except Exception:
-            cell_texts = []
-        await page_wait(50)
-    if not cell_texts:
-        try:
-            cell_texts = await element.locator("td").all_text_contents()
-        except Exception:
-            cell_texts = []
-
+def parse_offer_cells(cell_texts: list[str]) -> tuple[Decimal, str]:
+    """Parse one payout row from a DOM snapshot, without live locators."""
     # In the Paychain payout table the third data cell is the fiat amount
     # (the column labelled ``К отправке``).  It remains stable even when the
     # generated classes and text selectors change.
@@ -174,6 +153,34 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
     raise ValueError("У рядку не знайдено суму в третій клітинці")
 
 
+async def extract_offer_amount_and_currency(
+    element: Locator, settings: Settings, cell_texts: list[str] | None = None
+) -> tuple[Decimal, str]:
+    """Read the UAH amount while tolerating Angular row replacement."""
+    if cell_texts is None:
+        cell_texts = []
+        # Angular can replace the row node while the table timer is updating.
+        # Re-read the same locator briefly so a transient detached node is not
+        # treated as a malformed offer.
+        for _ in range(5):
+            try:
+                cell_texts = await element.evaluate(
+                    "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')",
+                    timeout=300,
+                )
+                if len(cell_texts) >= 3:
+                    break
+            except Exception:
+                cell_texts = []
+            await page_wait(50)
+        if not cell_texts:
+            try:
+                cell_texts = await element.locator("td").all_text_contents()
+            except Exception:
+                cell_texts = []
+    return parse_offer_cells(cell_texts)
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -195,7 +202,9 @@ async def select_thirty_rows(page: Page) -> None:
     await page.wait_for_timeout(300)
 
 
-async def find_offer_elements(page: Page, settings: Settings, timeout_ms: int = 8_000) -> list[Locator]:
+async def find_offer_elements(
+    page: Page, settings: Settings, timeout_ms: int = 8_000
+) -> tuple[list[Locator], list[list[str]]]:
     """Wait for Paychain's asynchronously rendered offer rows."""
     selectors = tuple(dict.fromkeys((
         settings.offer_selector,
@@ -207,26 +216,41 @@ async def find_offer_elements(page: Page, settings: Settings, timeout_ms: int = 
     deadline = time.monotonic() + timeout_ms / 1000
     while True:
         for selector in selectors:
-            elements = await page.locator(selector).all()
+            row_locator = page.locator(selector)
+            elements = await row_locator.all()
             if elements:
-                return elements
+                try:
+                    snapshots = await row_locator.evaluate_all(
+                        "rows => rows.map(row => Array.from(row.querySelectorAll('td')).map(td => td.innerText || td.textContent || ''))"
+                    )
+                except Exception:
+                    snapshots = []
+                return elements, snapshots
         # Stop early when Paychain explicitly renders the empty-table marker.
         if await page.locator("app-empty-table:visible").count():
-            return []
+            return [], []
         if time.monotonic() >= deadline:
-            return []
+            return [], []
         await page.wait_for_timeout(250)
 
 
 async def verify_amount_twice(page: Page, offer: Offer, settings: Settings) -> Decimal | None:
     try:
         await page.wait_for_timeout(100)
-        second_amount, _ = await extract_offer_amount_and_currency(offer.element, settings)
+        row_locator = page.locator(settings.offer_selector)
+        snapshots = await row_locator.evaluate_all(
+            "rows => rows.map(row => Array.from(row.querySelectorAll('td')).map(td => td.innerText || td.textContent || ''))"
+        )
+        for snapshot in snapshots:
+            try:
+                second_amount, _ = parse_offer_cells(snapshot)
+            except ValueError:
+                continue
+            if second_amount == offer.amount:
+                return second_amount
+        return None
     except (PlaywrightTimeoutError, ValueError):
         return None
-    if second_amount != offer.amount:
-        return None
-    return second_amount
 
 
 async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Settings) -> bool:
@@ -322,7 +346,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
             # Paychain renders the table asynchronously after reload. Poll
             # for rows instead of reading the DOM only once.
-            offer_elements = await find_offer_elements(page, settings)
+            offer_elements, row_snapshots = await find_offer_elements(page, settings)
             activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offer_elements))
             if not offer_elements:
                 row_count = await page.locator("tr").count()
@@ -334,7 +358,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                 )
             current_offers = []
 
-            for element in offer_elements:
+            for row_index, element in enumerate(offer_elements):
                 try:
                     if settings.offer_id_attribute:
                         offer_id = await element.get_attribute(settings.offer_id_attribute)
@@ -345,7 +369,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                         )
                         offer_id = sha256(text.encode()).hexdigest()
 
-                    amount, currency = await extract_offer_amount_and_currency(element, settings)
+                    snapshot = row_snapshots[row_index] if row_index < len(row_snapshots) else None
+                    amount, currency = await extract_offer_amount_and_currency(element, settings, snapshot)
 
                     if settings.status_selector:
                         status = (await text_in(element, settings.status_selector)).strip().casefold()
