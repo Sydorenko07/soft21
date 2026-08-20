@@ -8,7 +8,22 @@ $runAgent = Join-Path $root 'START\run_agent.cmd'
 
 Write-Host 'Installing Paychain local agent...' -ForegroundColor Cyan
 if (-not (Test-Path $python)) {
-    py -3.12 -m venv $venv
+    # Python Launcher (``py.exe``) is optional on Windows.  Prefer it when
+    # available, otherwise use the regular ``python``/``python3`` command.
+    $pythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+    $pythonCommand = if ($pythonLauncher) {
+        $pythonLauncher.Source
+    } else {
+        $pythonExecutable = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $pythonExecutable) {
+            $pythonExecutable = Get-Command python3 -ErrorAction SilentlyContinue
+        }
+        if (-not $pythonExecutable) {
+            throw 'Python не знайдено. Встановіть Python з https://www.python.org/downloads/ і увімкніть Add Python to PATH.'
+        }
+        $pythonExecutable.Source
+    }
+    & $pythonCommand -m venv $venv
 }
 if (-not (Test-Path $config) -and (Test-Path $configExample)) {
     Copy-Item $configExample $config
