@@ -221,6 +221,13 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
         iteration_start = time.monotonic()
 
         try:
+            # The agent pauses monitoring by removing the signal file.  Keep
+            # this browser context alive so the Paychain login session stays
+            # available for the next Start command.
+            if start_signal and not start_signal.exists():
+                await asyncio.sleep(0.5)
+                continue
+
             if page.is_closed():
                 logging.warning("Вікно %d: сторінка закрита", window_id)
                 break

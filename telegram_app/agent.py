@@ -35,13 +35,13 @@ class Agent:
         self.activity_position = ACTIVITY_LOG.stat().st_size if ACTIVITY_LOG.exists() else 0
 
     def start(self, threshold: str, refresh_seconds: str = "2") -> None:
-        if self.process and self.process.poll() is None and self.login_pending:
+        if self.process and self.process.poll() is None:
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
             SIGNAL_PATH.write_text("start", encoding="utf-8")
             self.login_pending = False
             return
-        self.stop()
+        self.terminate_process()
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
         SIGNAL_PATH.unlink(missing_ok=True)
@@ -52,7 +52,12 @@ class Agent:
         SIGNAL_PATH.write_text("start", encoding="utf-8")
 
     def open_login(self, threshold: str, refresh_seconds: str = "2") -> None:
-        self.stop()
+        if self.process and self.process.poll() is None:
+            self.threshold = threshold
+            self.refresh_seconds = refresh_seconds
+            SIGNAL_PATH.unlink(missing_ok=True)
+            self.login_pending = True
+            return
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
         SIGNAL_PATH.unlink(missing_ok=True)
@@ -63,6 +68,12 @@ class Agent:
         self.login_pending = True
 
     def stop(self) -> None:
+        """Pause monitoring but keep the browser and Paychain session open."""
+        SIGNAL_PATH.unlink(missing_ok=True)
+        self.login_pending = False
+
+    def terminate_process(self) -> None:
+        """Fully close the monitor process; used only for disconnect."""
         process = self.process
         if process and process.poll() is None:
             process.terminate()
@@ -77,7 +88,7 @@ class Agent:
 
     def clear_paychain_session(self) -> None:
         """Remove the local browser session only on an explicit disconnect."""
-        self.stop()
+        self.terminate_process()
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
         LEGACY_STATE_FILE.unlink(missing_ok=True)
 
