@@ -363,10 +363,13 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     if settings.offer_id_attribute:
                         offer_id = await element.get_attribute(settings.offer_id_attribute)
                     else:
-                        text = await element.evaluate(
-                            "el => el.innerText || el.textContent || ''",
-                            timeout=1_000,
-                        )
+                        snapshot = row_snapshots[row_index] if row_index < len(row_snapshots) else []
+                        text = "\n".join(snapshot)
+                        if not text:
+                            text = await element.evaluate(
+                                "el => el.innerText || el.textContent || ''",
+                                timeout=1_000,
+                            )
                         offer_id = sha256(text.encode()).hexdigest()
 
                     snapshot = row_snapshots[row_index] if row_index < len(row_snapshots) else None
