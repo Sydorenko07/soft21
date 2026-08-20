@@ -4,6 +4,7 @@ $venv = Join-Path $root '.venv'
 $python = Join-Path $venv 'Scripts\python.exe'
 $config = Join-Path $root 'config.json'
 $configExample = Join-Path $root 'config.example.json'
+$runAgent = Join-Path $root 'START\run_agent.cmd'
 
 Write-Host 'Installing Paychain local agent...' -ForegroundColor Cyan
 if (-not (Test-Path $python)) {
@@ -21,11 +22,11 @@ $startup = [Environment]::GetFolderPath('Startup')
 $shortcutPath = Join-Path $startup 'Paychain Control Agent.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = $python
-$shortcut.Arguments = ('"' + $agent + '"')
+$shortcut.TargetPath = $runAgent
+$shortcut.Arguments = ''
 $shortcut.WorkingDirectory = $root
 $shortcut.WindowStyle = 7
 $shortcut.Save()
 
-Start-Process -FilePath $python -ArgumentList ('"' + $agent + '"') -WorkingDirectory $root -WindowStyle Minimized
+Start-Process -FilePath $runAgent -WorkingDirectory $root -WindowStyle Normal
 Write-Host 'Agent installed and started. Pair the PC from the Telegram Mini App.' -ForegroundColor Green
