@@ -126,7 +126,8 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
     """Read the UAH amount even when Paychain changes inner-cell markup."""
     try:
         cell_texts = await element.evaluate(
-            "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')"
+            "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')",
+            timeout=1_000,
         )
     except Exception:
         cell_texts = await element.locator("td").all_text_contents()
@@ -320,7 +321,10 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     if settings.offer_id_attribute:
                         offer_id = await element.get_attribute(settings.offer_id_attribute)
                     else:
-                        text = await element.inner_text()
+                        text = await element.evaluate(
+                            "el => el.innerText || el.textContent || ''",
+                            timeout=1_000,
+                        )
                         offer_id = sha256(text.encode()).hexdigest()
 
                     amount, currency = await extract_offer_amount_and_currency(element, settings)
