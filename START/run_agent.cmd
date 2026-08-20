@@ -5,6 +5,6 @@ if not exist ".venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
-title Paychain Control Agent
-".venv\Scripts\python.exe" "telegram_app\agent.py"
-pause
+title Paychain Control Agent Launcher
+start "Paychain Control Agent" /min ".venv\Scripts\python.exe" "telegram_app\agent.py"
+exit /b 0

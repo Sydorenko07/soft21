@@ -206,7 +206,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     reported = set()
     seen_in_dry_run = set()
 
-    await page.goto(settings.offers_url)
+    await page.goto(settings.offers_url, wait_until="domcontentloaded", timeout=30_000)
+    await page.wait_for_timeout(1_000)
     try:
         await select_thirty_rows(page)
     except PlaywrightTimeoutError:
