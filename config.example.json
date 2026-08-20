@@ -1,5 +1,5 @@
 {
-  "offers_url": "https://app.paychain.fund/PUT_THE_OFFERS_PAGE_HERE",
+  "offers_url": "https://app.paychain.fund/pay-out",
   "refresh_seconds": 2,
   "minimum_amount_uah": 5000,
   "offer_selector": "tr.mdc-data-table__row:has(td:has-text('UAH'))",

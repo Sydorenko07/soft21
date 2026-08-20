@@ -13,6 +13,13 @@ if (-not (Test-Path $python)) {
 if (-not (Test-Path $config) -and (Test-Path $configExample)) {
     Copy-Item $configExample $config
 }
+if (Test-Path $config) {
+    $configText = Get-Content -LiteralPath $config -Raw
+    if ($configText.Contains('PUT_THE_OFFERS_PAGE_HERE')) {
+        $configText = $configText.Replace('https://app.paychain.fund/PUT_THE_OFFERS_PAGE_HERE', 'https://app.paychain.fund/pay-out')
+        Set-Content -LiteralPath $config -Value $configText -Encoding utf8
+    }
+}
 if (-not (Test-Path $runAgent)) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $runAgent) -Force | Out-Null
     @'
