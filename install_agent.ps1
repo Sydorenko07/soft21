@@ -13,6 +13,15 @@ if (-not (Test-Path $python)) {
 if (-not (Test-Path $config) -and (Test-Path $configExample)) {
     Copy-Item $configExample $config
 }
+if (-not (Test-Path $runAgent)) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $runAgent) -Force | Out-Null
+    @'
+@echo off
+cd /d "%~dp0.."
+".venv\Scripts\python.exe" "telegram_app\agent.py"
+pause
+'@ | Set-Content -LiteralPath $runAgent -Encoding ascii
+}
 & $python -m pip install --upgrade pip
 & $python -m pip install -r (Join-Path $root 'requirements.txt')
 & $python -m playwright install chromium
@@ -28,5 +37,5 @@ $shortcut.WorkingDirectory = $root
 $shortcut.WindowStyle = 7
 $shortcut.Save()
 
-Start-Process -FilePath $runAgent -WorkingDirectory $root -WindowStyle Normal
+Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c "' + $runAgent + '"') -WorkingDirectory $root -WindowStyle Normal
 Write-Host 'Agent installed and started. Pair the PC from the Telegram Mini App.' -ForegroundColor Green
