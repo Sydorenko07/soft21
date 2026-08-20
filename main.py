@@ -124,13 +124,26 @@ async def text_in(locator: Locator, selector: str) -> str:
 
 async def extract_offer_amount_and_currency(element: Locator, settings: Settings) -> tuple[Decimal, str]:
     """Read the UAH amount even when Paychain changes inner-cell markup."""
-    try:
-        cell_texts = await element.evaluate(
-            "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')",
-            timeout=1_000,
-        )
-    except Exception:
-        cell_texts = await element.locator("td").all_text_contents()
+    cell_texts: list[str] = []
+    # Angular can replace the row node while the table timer is updating.
+    # Re-read the same locator briefly so a transient detached node is not
+    # treated as a malformed offer.
+    for _ in range(5):
+        try:
+            cell_texts = await element.evaluate(
+                "el => Array.from(el.querySelectorAll('td')).map(td => td.innerText || td.textContent || '')",
+                timeout=300,
+            )
+            if len(cell_texts) >= 3:
+                break
+        except Exception:
+            cell_texts = []
+        await page_wait(50)
+    if not cell_texts:
+        try:
+            cell_texts = await element.locator("td").all_text_contents()
+        except Exception:
+            cell_texts = []
 
     # In the Paychain payout table the third data cell is the fiat amount
     # (the column labelled ``К отправке``).  It remains stable even when the
@@ -159,6 +172,11 @@ async def extract_offer_amount_and_currency(element: Locator, settings: Settings
         return parse_amount(match.group(1)), "UAH"
 
     raise ValueError("У рядку не знайдено суму в третій клітинці")
+
+
+async def page_wait(milliseconds: int) -> None:
+    """Small cancellable delay used while Angular replaces table nodes."""
+    await asyncio.sleep(milliseconds / 1000)
 
 
 async def select_thirty_rows(page: Page) -> None:
