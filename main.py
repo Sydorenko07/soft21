@@ -50,6 +50,15 @@ class Offer:
     element: Locator
 
 
+@dataclass(frozen=True)
+class ApiOffer:
+    """Safe subset of an offer returned by Paychain's trading API."""
+    offer_id: str
+    amount: Decimal
+    currency: str
+    status: str
+
+
 def load_settings(config_path: Path) -> Settings:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     required = (
@@ -89,6 +98,66 @@ def parse_amount(raw: str) -> Decimal:
 def normalize_currency(raw: str) -> str:
     match = re.search(r"\b(UAH|USD|EUR|USDT)\b", raw.upper())
     return match.group(1) if match else raw.strip().upper()
+
+
+def extract_api_offers(payload: object) -> list[ApiOffer]:
+    """Extract payout offers from the API response's ``data`` structure."""
+    found: list[ApiOffer] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+
+        if value.get("type") == "pay-out" and value.get("id") and value.get("fiatAmount") is not None:
+            try:
+                currency = normalize_currency(str(value.get("fiatCurrency", "")))
+                if currency:
+                    raw_status = str(value.get("status", "")).casefold()
+                    # The API calls actionable payout rows ``pending`` while
+                    # the UI exposes them with an Accept button.
+                    status = "active" if raw_status == "pending" else raw_status
+                    found.append(ApiOffer(
+                        offer_id=str(value["id"]),
+                        amount=parse_amount(str(value["fiatAmount"])),
+                        currency=currency,
+                        status=status,
+                    ))
+            except (InvalidOperation, ValueError):
+                pass
+
+        for nested in value.values():
+            visit(nested)
+
+    visit(payload)
+    unique: dict[str, ApiOffer] = {offer.offer_id: offer for offer in found}
+    return list(unique.values())
+
+
+def merge_api_offers(api_offers: list[ApiOffer], dom_offers: list[Offer]) -> list[Offer]:
+    """Apply API ID/amount/status to matching visible rows for button clicks."""
+    remaining = list(dom_offers)
+    merged: list[Offer] = []
+    for api_offer in api_offers:
+        match_index = next(
+            (index for index, dom_offer in enumerate(remaining)
+             if dom_offer.amount == api_offer.amount and dom_offer.currency == api_offer.currency),
+            None,
+        )
+        if match_index is None:
+            continue
+        dom_offer = remaining.pop(match_index)
+        merged.append(replace(
+            dom_offer,
+            offer_id=api_offer.offer_id,
+            amount=api_offer.amount,
+            currency=api_offer.currency,
+            status=api_offer.status,
+        ))
+    return merged
 
 
 async def load_processed() -> set[str]:
@@ -439,22 +508,36 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     reported = set()
     seen_in_dry_run = set()
     network_offer_event = asyncio.Event()
+    api_offers: list[ApiOffer] = []
+    response_tasks: set[asyncio.Task[None]] = set()
 
-    def on_response(response) -> None:
-        """Wake the scanner when Paychain's offer API returns new data."""
+    async def capture_offer_response(response) -> None:
+        """Read the authenticated JSON response containing payout offers."""
+        nonlocal api_offers
         try:
             request = response.request
             url = response.url.lower()
             if request.resource_type not in {"xhr", "fetch"}:
                 return
-            if "/user/trading/pay-out" not in url:
+            if "/user/trading" not in url:
                 return
             if url.rstrip("/").endswith("/accept"):
                 return
+            if "type=pay-out" not in url and "/pay-out" not in url:
+                return
+            payload = await response.json()
+            parsed = extract_api_offers(payload)
+            api_offers = parsed
+            activity_log.info("API | отримано оферів: %d", len(parsed))
             network_offer_event.set()
         except Exception:
-            # A response may be disposed while a page is closing.
+            # Non-JSON responses and disposed responses are irrelevant here.
             pass
+
+    def on_response(response) -> None:
+        task = asyncio.create_task(capture_offer_response(response))
+        response_tasks.add(task)
+        task.add_done_callback(response_tasks.discard)
 
     page.on("response", on_response)
 
@@ -505,7 +588,10 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
             await wait_for_offer_table(page)
 
-            current_offers = await scan_offers(page, settings)
+            dom_offers = await scan_offers(page, settings)
+            # API data supplies the authoritative ID, amount and status;
+            # visible DOM rows are retained only to scope the button click.
+            current_offers = merge_api_offers(api_offers, dom_offers) if api_offers else dom_offers
             activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(current_offers))
             if not current_offers:
                 row_count = await page.locator("tr").count()
