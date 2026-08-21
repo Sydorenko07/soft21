@@ -376,6 +376,42 @@ async def select_thirty_rows(page: Page) -> None:
     await page.wait_for_timeout(300)
 
 
+async def go_to_next_offer_page(page: Page) -> bool:
+    """Move to the next paginator page, returning False on the last page."""
+    selectors = (
+        "button.p-paginator-next",
+        "button[aria-label='Next Page']",
+        "button[aria-label='Next page']",
+    )
+    for selector in selectors:
+        button = page.locator(selector).first
+        if await button.count() == 0:
+            continue
+        if await button.is_disabled():
+            return False
+        await button.click()
+        await wait_for_offer_table(page)
+        await page.wait_for_timeout(150)
+        return True
+    return False
+
+
+async def go_to_first_offer_page(page: Page) -> None:
+    """Return to page one after scanning the second page."""
+    selectors = (
+        "button.p-paginator-first",
+        "button[aria-label='First Page']",
+        "button[aria-label='First page']",
+    )
+    for selector in selectors:
+        button = page.locator(selector).first
+        if await button.count() and not await button.is_disabled():
+            await button.click()
+            await wait_for_offer_table(page)
+            await page.wait_for_timeout(150)
+            return
+
+
 async def find_offer_elements(
     page: Page, settings: Settings, timeout_ms: int = 8_000
 ) -> tuple[list[Locator], list[list[str]]]:
@@ -501,6 +537,64 @@ async def accept_offer_with_double_click(page: Page, offer: Offer, settings: Set
         return False
 
 
+async def process_offer_batch(
+    page: Page,
+    offers: list[Offer],
+    settings: Settings,
+    auto_accept: bool,
+    window_id: int,
+    reported: set[str],
+    seen_in_dry_run: set[str],
+    processed: set[str],
+) -> None:
+    """Compare and optionally accept every offer on the currently visible page."""
+    activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offers))
+    for offer in offers:
+        # Only skip an offer after it qualifies and was already accepted.  This
+        # lets a changed threshold re-evaluate offers that were previously below
+        # the threshold, while still preventing duplicate accepts.
+        qualifies = (
+            offer.currency == "UAH"
+            and offer.status in settings.active_statuses
+            and offer.amount >= settings.minimum_amount_uah
+        )
+        if not qualifies:
+            reasons: list[str] = []
+            if offer.currency != "UAH":
+                reasons.append(f"валюта {offer.currency}")
+            if offer.status not in settings.active_statuses:
+                reasons.append(f"статус {offer.status}")
+            if offer.amount < settings.minimum_amount_uah:
+                reasons.append(f"сума {offer.amount} < порога {settings.minimum_amount_uah}")
+            if offer.offer_id not in reported:
+                activity_log.info(
+                    "Вікно %d | ПРОПУЩЕНО | оффер %s | %s %s | %s",
+                    window_id, offer.offer_id[:8], offer.amount, offer.currency, "; ".join(reasons),
+                )
+                reported.add(offer.offer_id)
+            continue
+
+        async with _processed_lock:
+            if offer.offer_id in _processed_cache:
+                continue
+        logging.warning(
+            "Вікно %d | НОВИЙ ОФФЕР: %s — %s %s (%s)",
+            window_id, offer.offer_id[:8], offer.amount, offer.currency, offer.status,
+        )
+        if auto_accept:
+            async with _processed_lock:
+                if offer.offer_id in _processed_cache:
+                    continue
+            if await accept_offer_with_double_click(page, offer, settings):
+                await save_processed({offer.offer_id})
+                processed.add(offer.offer_id)
+        elif offer.offer_id not in seen_in_dry_run:
+            activity_log.info(
+                "Вікно %d | ПІДХОДИТЬ, АЛЕ НЕ ПРИЙНЯТО | оффер %s | %s %s | тестовий режим",
+                window_id, offer.offer_id[:8], offer.amount, offer.currency,
+            )
+            seen_in_dry_run.add(offer.offer_id)
+
 async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path | None,
                         page: Page, window_id: int) -> None:
     """Один екземпляр моніторингу на окремій сторінці."""
@@ -588,68 +682,35 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
             await wait_for_offer_table(page)
 
-            dom_offers = await scan_offers(page, settings)
-            # API data supplies the authoritative ID, amount and status;
-            # visible DOM rows are retained only to scope the button click.
-            current_offers = merge_api_offers(api_offers, dom_offers) if api_offers else dom_offers
-            activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(current_offers))
-            if not current_offers:
-                row_count = await page.locator("tr").count()
-                tbody_count = await page.locator("tbody tr").count()
-                role_row_count = await page.locator("[role='row']").count()
-                activity_log.info(
-                    "Вікно %d | СТОРІНКА | url=%s | title=%s | tr=%d | tbody_tr=%d | role_row=%d",
-                    window_id, page.url, await page.title(), row_count, tbody_count, role_row_count,
+            # Scan page 1 and page 2.  Each page is processed while its DOM
+            # locators are still valid, then we return to page 1.
+            for page_number in (1, 2):
+                if page_number == 2:
+                    api_offers = []
+                    network_offer_event.clear()
+                    if not await go_to_next_offer_page(page):
+                        break
+                    try:
+                        await asyncio.wait_for(network_offer_event.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+                dom_offers = await scan_offers(page, settings)
+                # API data supplies authoritative IDs/status; DOM rows scope
+                # the button click on the currently visible page.
+                current_offers = merge_api_offers(api_offers, dom_offers) if api_offers else dom_offers
+                if not current_offers:
+                    row_count = await page.locator("tr").count()
+                    tbody_count = await page.locator("tbody tr").count()
+                    role_row_count = await page.locator("[role='row']").count()
+                    activity_log.info(
+                        "Вікно %d | СТОРІНКА %d | url=%s | title=%s | tr=%d | tbody_tr=%d | role_row=%d",
+                        window_id, page_number, page.url, await page.title(), row_count, tbody_count, role_row_count,
+                    )
+                await process_offer_batch(
+                    page, current_offers, settings, auto_accept, window_id,
+                    reported, seen_in_dry_run, processed,
                 )
-            for offer in current_offers:
-                # Перевіряємо спільний кеш (з замком)
-                async with _processed_lock:
-                    if offer.offer_id in _processed_cache:
-                        continue
-
-                # Після першого успішного читання рядка одразу перевіряємо
-                # поріг і переходимо до прийняття. Друга перевірка тут не
-                # використовується, щоб не втрачати швидкі офери.
-                reasons: list[str] = []
-
-                if offer.currency != "UAH":
-                    reasons.append(f"валюта {offer.currency}")
-                if offer.status not in settings.active_statuses:
-                    reasons.append(f"статус {offer.status}")
-                if offer.amount < settings.minimum_amount_uah:
-                    reasons.append(f"сума {offer.amount} < порога {settings.minimum_amount_uah}")
-
-                qualifies = (
-                    offer.currency == "UAH"
-                    and offer.status in settings.active_statuses
-                    and offer.amount >= settings.minimum_amount_uah
-                )
-
-                if not qualifies:
-                    if offer.offer_id not in reported:
-                        logging.info("Вікно %d | Оффер %s: пропущено (%s).", window_id, offer.offer_id[:8], "; ".join(reasons))
-                        activity_log.info("Вікно %d | ПРОПУЩЕНО | оффер %s | %s %s | %s", window_id, offer.offer_id[:8], offer.amount, offer.currency, "; ".join(reasons))
-                        reported.add(offer.offer_id)
-                    continue
-
-                logging.warning("Вікно %d | НОВИЙ ОФФЕР: %s — %s %s (%s)", window_id, offer.offer_id[:8], offer.amount, offer.currency, offer.status)
-
-                if auto_accept:
-                    # Ще раз перевіряємо, чи не прийняв офер інший контекст (з замком)
-                    async with _processed_lock:
-                        if offer.offer_id in _processed_cache:
-                            logging.info("Вікно %d | Офер %s вже прийнято іншим вікном, пропускаю.", window_id, offer.offer_id[:8])
-                            continue
-
-                    # Приймаємо
-                    if await accept_offer_with_double_click(page, offer, settings):
-                        await save_processed({offer.offer_id})
-                        processed.add(offer.offer_id)
-                else:
-                    if offer.offer_id not in seen_in_dry_run:
-                        logging.warning("Вікно %d | DRY-RUN: оффер не прийнято.", window_id)
-                        activity_log.info("Вікно %d | ПІДХОДИТЬ, АЛЕ НЕ ПРИЙНЯТО | оффер %s | %s %s | тестовий режим", window_id, offer.offer_id[:8], offer.amount, offer.currency)
-                        seen_in_dry_run.add(offer.offer_id)
+            await go_to_first_offer_page(page)
 
         except PlaywrightTimeoutError:
             logging.warning("Вікно %d: таймаут", window_id)
