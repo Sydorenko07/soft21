@@ -363,6 +363,22 @@ async def wait_for_offer_table(page: Page, timeout_ms: int = 8_000) -> None:
         await page.wait_for_timeout(250)
 
 
+async def wait_for_rendered_rows(page: Page, expected_count: int = 0, timeout_ms: int = 3_000) -> None:
+    """Wait until Angular has rendered the offer rows, not just empty shells."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            rendered = await page.locator("tbody tr").evaluate_all(
+                "rows => rows.filter(row => { const cells = Array.from(row.querySelectorAll('td')); "
+                "return cells.length > 2 && /[0-9]/.test(cells[2].innerText || cells[2].textContent || ''); }).length"
+            )
+        except Exception:
+            rendered = 0
+        if rendered and (not expected_count or rendered >= expected_count):
+            return
+        await page.wait_for_timeout(100)
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -707,6 +723,10 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                         await asyncio.wait_for(network_offer_event.wait(), timeout=1.0)
                     except asyncio.TimeoutError:
                         pass
+                # API responses can arrive before Angular has painted every
+                # row.  Wait for the expected number of rendered amount cells
+                # before taking the snapshot used for threshold checks.
+                await wait_for_rendered_rows(page, expected_count=len(api_offers), timeout_ms=3_000)
                 dom_offers = await scan_offers(page, settings)
                 # API data supplies authoritative IDs/status; DOM rows scope
                 # the button click on the currently visible page.
