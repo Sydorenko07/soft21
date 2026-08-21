@@ -138,7 +138,12 @@ def extract_api_offers(payload: object) -> list[ApiOffer]:
 
 
 def merge_api_offers(api_offers: list[ApiOffer], dom_offers: list[Offer]) -> list[Offer]:
-    """Apply API ID/amount/status to matching visible rows for button clicks."""
+    """Apply API ID/amount/status to visible rows without dropping DOM rows.
+
+    Paychain can emit several trading responses while Angular is replacing the
+    table.  A stale response must not make a visible row disappear from the
+    scan, so unmatched DOM rows are retained with their stable fallback ID.
+    """
     remaining = list(dom_offers)
     merged: list[Offer] = []
     for api_offer in api_offers:
@@ -157,6 +162,9 @@ def merge_api_offers(api_offers: list[ApiOffer], dom_offers: list[Offer]) -> lis
             currency=api_offer.currency,
             status=api_offer.status,
         ))
+    # Keep rows that were visible but did not have a matching API item.  They
+    # still have a valid row-scoped Accept button and can be checked by amount.
+    merged.extend(remaining)
     return merged
 
 
@@ -378,16 +386,17 @@ async def select_thirty_rows(page: Page) -> None:
 
 async def go_to_next_offer_page(page: Page) -> bool:
     """Move to the next paginator page, returning False on the last page."""
-    selectors = (
-        "button.p-paginator-next",
-        "button[aria-label='Next Page']",
-        "button[aria-label='Next page']",
-    )
-    for selector in selectors:
-        button = page.locator(selector).first
-        if await button.count() == 0:
+    paginator = page.locator("p-paginator").first
+    buttons = paginator.locator("button") if await paginator.count() else page.locator("button")
+    count = await buttons.count()
+    for index in range(count):
+        button = buttons.nth(index)
+        label = ((await button.get_attribute("aria-label")) or "").casefold()
+        classes = ((await button.get_attribute("class")) or "").casefold()
+        if "next" not in label and "paginator-next" not in classes:
             continue
-        if await button.is_disabled():
+        disabled = await button.is_disabled() or (await button.get_attribute("aria-disabled")) == "true"
+        if disabled:
             return False
         await button.click()
         await wait_for_offer_table(page)
@@ -398,18 +407,21 @@ async def go_to_next_offer_page(page: Page) -> bool:
 
 async def go_to_first_offer_page(page: Page) -> None:
     """Return to page one after scanning the second page."""
-    selectors = (
-        "button.p-paginator-first",
-        "button[aria-label='First Page']",
-        "button[aria-label='First page']",
-    )
-    for selector in selectors:
-        button = page.locator(selector).first
-        if await button.count() and not await button.is_disabled():
-            await button.click()
-            await wait_for_offer_table(page)
-            await page.wait_for_timeout(150)
+    paginator = page.locator("p-paginator").first
+    buttons = paginator.locator("button") if await paginator.count() else page.locator("button")
+    count = await buttons.count()
+    for index in range(count):
+        button = buttons.nth(index)
+        label = ((await button.get_attribute("aria-label")) or "").casefold()
+        classes = ((await button.get_attribute("class")) or "").casefold()
+        if "first" not in label and "paginator-first" not in classes:
+            continue
+        if await button.is_disabled() or (await button.get_attribute("aria-disabled")) == "true":
             return
+        await button.click()
+        await wait_for_offer_table(page)
+        await page.wait_for_timeout(150)
+        return
 
 
 async def find_offer_elements(
