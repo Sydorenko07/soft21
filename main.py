@@ -368,18 +368,18 @@ async def page_wait(milliseconds: int) -> None:
     await asyncio.sleep(milliseconds / 1000)
 
 
-async def select_thirty_rows(page: Page) -> None:
-    """Set Paychain's paginator to show 30 offers when the control is present."""
+async def select_ten_rows(page: Page) -> None:
+    """Keep ten rows per page so the next page is checked automatically."""
     dropdown = page.locator("p-select.p-paginator-rpp-dropdown").first
     try:
         await dropdown.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeoutError:
         return
     label = dropdown.locator("[role='combobox']").first
-    if (await label.inner_text()).strip() == "30":
+    if (await label.inner_text()).strip() == "10":
         return
     await dropdown.locator("[role='button'][aria-label='dropdown trigger']").click(timeout=5_000)
-    option = page.locator("[role='option']").filter(has_text=re.compile(r"^\s*30\s*$")).last
+    option = page.locator("[role='option']").filter(has_text=re.compile(r"^\s*10\s*$")).last
     await option.click(timeout=5_000)
     await page.wait_for_timeout(300)
 
@@ -555,12 +555,13 @@ async def process_offer_batch(
     settings: Settings,
     auto_accept: bool,
     window_id: int,
+    page_number: int,
     reported: set[str],
     seen_in_dry_run: set[str],
     processed: set[str],
 ) -> None:
     """Compare and optionally accept every offer on the currently visible page."""
-    activity_log.info("Вікно %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, len(offers))
+    activity_log.info("Вікно %d | СТОРІНКА %d | СКАНУВАННЯ | знайдено рядків: %d", window_id, page_number, len(offers))
     for offer in offers:
         # Only skip an offer after it qualifies and was already accepted.  This
         # lets a changed threshold re-evaluate offers that were previously below
@@ -650,9 +651,9 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     await page.goto(settings.offers_url, wait_until="domcontentloaded", timeout=30_000)
     await page.wait_for_timeout(1_000)
     try:
-        await select_thirty_rows(page)
+        await select_ten_rows(page)
     except PlaywrightTimeoutError:
-        logging.warning("Не вдалося вибрати 30 оферів на сторінці")
+        logging.warning("Не вдалося встановити 10 оферів на сторінці")
 
     if start_signal:
         while not start_signal.exists():
@@ -719,7 +720,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                         window_id, page_number, page.url, await page.title(), row_count, tbody_count, role_row_count,
                     )
                 await process_offer_batch(
-                    page, current_offers, settings, auto_accept, window_id,
+                    page, current_offers, settings, auto_accept, window_id, page_number,
                     reported, seen_in_dry_run, processed,
                 )
             await go_to_first_offer_page(page)
