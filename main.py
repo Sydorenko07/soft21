@@ -438,6 +438,25 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     processed = await load_processed()
     reported = set()
     seen_in_dry_run = set()
+    network_offer_event = asyncio.Event()
+
+    def on_response(response) -> None:
+        """Wake the scanner when Paychain's offer API returns new data."""
+        try:
+            request = response.request
+            url = response.url.lower()
+            if request.resource_type not in {"xhr", "fetch"}:
+                return
+            if "/user/trading/pay-out" not in url:
+                return
+            if url.rstrip("/").endswith("/accept"):
+                return
+            network_offer_event.set()
+        except Exception:
+            # A response may be disposed while a page is closing.
+            pass
+
+    page.on("response", on_response)
 
     await page.goto(settings.offers_url, wait_until="domcontentloaded", timeout=30_000)
     await page.wait_for_timeout(1_000)
@@ -450,9 +469,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
         while not start_signal.exists():
             await asyncio.sleep(0.5)
 
+    monitoring_started = False
     while True:
-        iteration_start = time.monotonic()
-
         try:
             # The agent pauses monitoring by removing the signal file.  Keep
             # this browser context alive so the Paychain login session stays
@@ -465,10 +483,26 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                 logging.warning("Вікно %d: сторінка закрита", window_id)
                 break
 
-            await page.reload(wait_until="domcontentloaded", timeout=30_000)
-            # Paychain renders rows asynchronously after DOMContentLoaded.
-            # The original monitor waited briefly, then scanned each row live.
-            await page.wait_for_timeout(800)
+            if monitoring_started:
+                try:
+                    # Network responses trigger an immediate scan.  If the
+                    # page has no internal polling, the timeout keeps the old
+                    # periodic reload as a reliable fallback.
+                    await asyncio.wait_for(
+                        network_offer_event.wait(),
+                        timeout=max(1.0, settings.refresh_seconds),
+                    )
+                    network_offer_event.clear()
+                    await page.wait_for_timeout(100)
+                except asyncio.TimeoutError:
+                    await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                    await page.wait_for_timeout(800)
+            else:
+                # Scan the page that the user logged into; do not force an
+                # extra reload on the first start command.
+                monitoring_started = True
+                network_offer_event.clear()
+
             await wait_for_offer_table(page)
 
             current_offers = await scan_offers(page, settings)
@@ -536,9 +570,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
         except Exception:
             logging.exception("Вікно %d: помилка циклу", window_id)
 
-        elapsed = time.monotonic() - iteration_start
-        sleep_time = max(0, settings.refresh_seconds - elapsed)
-        await asyncio.sleep(sleep_time)
+        # The next iteration is released by a network response or by the
+        # configured periodic reload timeout above.
 
 
 async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
