@@ -365,6 +365,11 @@ async def wait_for_offer_table(page: Page, timeout_ms: int = 8_000) -> None:
 
 async def wait_for_rendered_rows(page: Page, expected_count: int = 0, timeout_ms: int = 3_000) -> None:
     """Wait until Angular has rendered the offer rows, not just empty shells."""
+    # A zero-item API response is already a completed empty result.  Do not
+    # spend the full render timeout waiting for rows that cannot appear.
+    if expected_count <= 0:
+        await page.wait_for_timeout(100)
+        return
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         try:
@@ -736,7 +741,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                 monitoring_started = True
                 network_offer_event.clear()
 
-            await wait_for_offer_table(page)
+            await wait_for_offer_table(page, timeout_ms=3_000)
 
             # Scan pages 1 through 10.  Each page is processed while its DOM
             # locators are still valid, then we return to page 1.
@@ -771,6 +776,10 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     page, current_offers, settings, auto_accept, window_id, page_number,
                     reported, seen_in_dry_run, processed,
                 )
+                # With no API rows and no visible DOM rows there cannot be a
+                # second page to inspect.  Avoid needless paginator waits.
+                if page_number == 1 and not current_offers and not api_offers:
+                    break
                 page_number += 1
             await go_to_first_offer_page(page)
 
