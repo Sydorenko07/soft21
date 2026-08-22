@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -37,6 +38,7 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 BOT_INTERNAL_TOKEN = os.environ.get("BOT_INTERNAL_TOKEN", "")
 DEV_USER_ID = os.environ.get("DEV_TELEGRAM_USER_ID")
 active_agents: dict[str, WebSocket] = {}
+logger = logging.getLogger("paychain.server")
 
 
 def db() -> sqlite3.Connection:
@@ -235,9 +237,24 @@ async def bot_command(
 
 async def notify_telegram(owner_id: str, text: str) -> None:
     if not BOT_TOKEN:
+        logger.error("Telegram notification skipped: TELEGRAM_BOT_TOKEN is not configured")
         return
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": owner_id, "text": text})
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": owner_id, "text": text},
+            )
+        if response.status_code >= 400:
+            logger.error("Telegram notification failed: HTTP %s, body=%s", response.status_code, response.text[:300])
+        else:
+            payload = response.json()
+            if not payload.get("ok"):
+                logger.error("Telegram notification rejected: %s", response.text[:300])
+            else:
+                logger.info("Telegram notification sent to owner %s", owner_id)
+    except (httpx.HTTPError, ValueError) as error:
+        logger.exception("Telegram notification error: %s", error)
 
 
 @app.websocket("/ws/agent")
