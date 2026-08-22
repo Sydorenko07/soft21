@@ -625,7 +625,7 @@ async def process_offer_batch(
             seen_in_dry_run.add(offer.offer_id)
 
 async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path | None,
-                        page: Page, window_id: int) -> None:
+                         login_signal: Path | None, page: Page, window_id: int) -> None:
     """Один екземпляр моніторингу на окремій сторінці."""
     processed = await load_processed()
     reported = set()
@@ -666,6 +666,16 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
     await page.goto(settings.offers_url, wait_until="domcontentloaded", timeout=30_000)
     await page.wait_for_timeout(1_000)
+    # The login command keeps monitoring paused, but we still wait for the
+    # authenticated payout table so the agent can tell Telegram that manual
+    # login has completed.
+    await wait_for_offer_table(page, timeout_ms=15_000)
+    if login_signal and (
+        await page.locator("tbody tr").count()
+        or await page.locator("app-empty-table:visible").count()
+    ):
+        login_signal.parent.mkdir(parents=True, exist_ok=True)
+        login_signal.write_text("ready", encoding="utf-8")
     try:
         await select_ten_rows(page)
     except PlaywrightTimeoutError:
@@ -711,10 +721,11 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
             await wait_for_offer_table(page)
 
-            # Scan page 1 and page 2.  Each page is processed while its DOM
+            # Scan pages 1 through 10.  Each page is processed while its DOM
             # locators are still valid, then we return to page 1.
-            for page_number in (1, 2):
-                if page_number == 2:
+            page_number = 1
+            while page_number <= 10:
+                if page_number > 1:
                     api_offers = []
                     network_offer_event.clear()
                     if not await go_to_next_offer_page(page):
@@ -743,6 +754,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
                     page, current_offers, settings, auto_accept, window_id, page_number,
                     reported, seen_in_dry_run, processed,
                 )
+                page_number += 1
             await go_to_first_offer_page(page)
 
         except PlaywrightTimeoutError:
@@ -755,7 +767,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
 
 async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
-              minimized: bool, windows: int) -> None:
+              login_signal: Path | None, minimized: bool, windows: int) -> None:
     """Запускає один браузер з кількома сторінками (вікнами)."""
     # Завантажуємо кеш оброблених оферів перед запуском
     await load_processed()
@@ -774,7 +786,7 @@ async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
         for i in range(windows):
             page = existing_pages[i] if i < len(existing_pages) else await context.new_page()
             task = asyncio.create_task(
-                run_instance(settings, auto_accept, start_signal, page, i + 1)
+                run_instance(settings, auto_accept, start_signal, login_signal, page, i + 1)
             )
             tasks.append(task)
 
@@ -804,6 +816,7 @@ def main() -> None:
     parser.add_argument("--refresh-seconds", type=float, help="Інтервал оновлення сторінки в секундах")
     parser.add_argument("--windows", type=int, default=1, help="Кількість одночасних вікон моніторингу (за замовчуванням 1)")
     parser.add_argument("--start-signal", type=Path, help="Файл-сигнал запуску для вікна керування")
+    parser.add_argument("--login-signal", type=Path, help="Файл-сигнал успішного входу в Paychain")
     parser.add_argument("--minimized", action="store_true", help="Запустити браузер мінімізованим")
     args = parser.parse_args()
 
@@ -821,7 +834,7 @@ def main() -> None:
         if args.windows < 1:
             raise ValueError("windows має бути >= 1")
 
-        asyncio.run(run(settings, args.auto_accept, args.start_signal, args.minimized, args.windows))
+        asyncio.run(run(settings, args.auto_accept, args.start_signal, args.login_signal, args.minimized, args.windows))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         logging.error("Конфігурація: %s", error)
         raise SystemExit(2) from error

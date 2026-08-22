@@ -262,6 +262,8 @@ async def agent_socket(socket: WebSocket) -> None:
             running = 1 if event.get("running") else 0
             with db() as connection:
                 connection.execute("UPDATE agents SET running=?, last_status=?, updated_at=? WHERE agent_id=?", (running, status, int(time.time()), agent_id))
+            if event.get("login_ready"):
+                await notify_telegram(row["owner_id"], "✅ Вхід у Paychain виконано. Очікується запуск алгоритму.")
             if event.get("accepted"):
                 await notify_telegram(row["owner_id"], f"✅ Угоду прийнято\nСума: {event.get('amount')} {event.get('currency', 'UAH')}")
     except WebSocketDisconnect:

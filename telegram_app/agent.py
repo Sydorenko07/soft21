@@ -19,6 +19,7 @@ ROOT = Path(__file__).parents[1]
 HERE = Path(__file__).parent
 CONFIG_PATH = HERE / "agent-config.json"
 SIGNAL_PATH = ROOT / ".start_monitoring.signal"
+LOGIN_SIGNAL_PATH = ROOT / ".paychain_login_ready.signal"
 ACTIVITY_LOG = ROOT / "logs" / "activity.log"
 DOWNLOAD_CONFIG_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads" / "agent-config.json"
 PROFILE_DIR = ROOT / ".browser-profile"
@@ -32,6 +33,8 @@ class Agent:
         self.threshold = "5000"
         self.refresh_seconds = "2"
         self.login_pending = False
+        self.login_ready = False
+        self.login_notice_pending = False
         self.activity_position = ACTIVITY_LOG.stat().st_size if ACTIVITY_LOG.exists() else 0
 
     def process_alive(self) -> bool:
@@ -42,7 +45,10 @@ class Agent:
             return True
         self.process = None
         self.login_pending = False
+        self.login_ready = False
+        self.login_notice_pending = False
         SIGNAL_PATH.unlink(missing_ok=True)
+        LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         return False
 
     def start(self, threshold: str, refresh_seconds: str = "2") -> None:
@@ -51,13 +57,18 @@ class Agent:
             self.refresh_seconds = refresh_seconds
             SIGNAL_PATH.write_text("start", encoding="utf-8")
             self.login_pending = False
+            self.login_ready = False
+            LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
             return
         self.terminate_process()
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
         SIGNAL_PATH.unlink(missing_ok=True)
+        LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
+        self.login_ready = False
+        self.login_notice_pending = False
         self.process = subprocess.Popen(
-            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH), "--minimized"],
+            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH), "--minimized"],
             cwd=ROOT,
         )
         SIGNAL_PATH.write_text("start", encoding="utf-8")
@@ -67,21 +78,29 @@ class Agent:
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
             SIGNAL_PATH.unlink(missing_ok=True)
+            LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
             self.login_pending = True
+            self.login_ready = False
+            self.login_notice_pending = False
             return
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
         SIGNAL_PATH.unlink(missing_ok=True)
+        LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         self.process = subprocess.Popen(
-            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH)],
+            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH)],
             cwd=ROOT,
         )
         self.login_pending = True
+        self.login_ready = False
+        self.login_notice_pending = False
 
     def stop(self) -> None:
         """Pause monitoring but keep the browser and Paychain session open."""
         SIGNAL_PATH.unlink(missing_ok=True)
         self.login_pending = False
+        self.login_ready = False
+        self.login_notice_pending = False
 
     def terminate_process(self) -> None:
         """Fully close the monitor process; used only for disconnect."""
@@ -95,7 +114,10 @@ class Agent:
                 process.wait(timeout=5)
         self.process = None
         self.login_pending = False
+        self.login_ready = False
+        self.login_notice_pending = False
         SIGNAL_PATH.unlink(missing_ok=True)
+        LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
 
     def clear_paychain_session(self) -> None:
         """Remove the local browser session only on an explicit disconnect."""
@@ -196,8 +218,22 @@ async def run() -> None:
                             break
                     except asyncio.TimeoutError:
                         pass
-                    status = "Очікується вхід у Paychain" if agent.login_pending else ("Моніторинг працює" if agent.running else "Зупинено")
-                    await socket.send(json.dumps({"type": "status", "running": agent.running and not agent.login_pending, "status": status}))
+                    if agent.login_pending and LOGIN_SIGNAL_PATH.exists():
+                        agent.login_pending = False
+                        agent.login_ready = True
+                        agent.login_notice_pending = True
+                        LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
+                    if agent.login_pending:
+                        status = "Очікується вхід у Paychain"
+                    elif agent.login_ready:
+                        status = "Вхід у Paychain виконано, очікується запуск алгоритму"
+                    else:
+                        status = "Моніторинг працює" if agent.running else "Зупинено"
+                    status_event = {"type": "status", "running": agent.running and not agent.login_pending and not agent.login_ready, "status": status}
+                    if agent.login_notice_pending:
+                        status_event["login_ready"] = True
+                        agent.login_notice_pending = False
+                    await socket.send(json.dumps(status_event))
                     for event in agent.new_activity():
                         await socket.send(json.dumps({"type": "status", "running": agent.running, "status": "Угоду прийнято", "accepted": True, **event}))
         except Exception as error:
