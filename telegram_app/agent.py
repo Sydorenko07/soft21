@@ -36,6 +36,7 @@ class Agent:
         self.login_pending = False
         self.login_ready = False
         self.login_notice_pending = False
+        self.monitoring_enabled = False
         self.activity_position = ACTIVITY_LOG.stat().st_size if ACTIVITY_LOG.exists() else 0
 
     def write_runtime_settings(self) -> None:
@@ -54,6 +55,7 @@ class Agent:
         self.login_pending = False
         self.login_ready = False
         self.login_notice_pending = False
+        self.monitoring_enabled = False
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         RUNTIME_SETTINGS_PATH.unlink(missing_ok=True)
@@ -67,6 +69,7 @@ class Agent:
             SIGNAL_PATH.write_text("start", encoding="utf-8")
             self.login_pending = False
             self.login_ready = False
+            self.monitoring_enabled = True
             LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
             return
         self.terminate_process()
@@ -77,6 +80,7 @@ class Agent:
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         self.login_ready = False
         self.login_notice_pending = False
+        self.monitoring_enabled = True
         command = [
             str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept",
             "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds,
@@ -96,6 +100,7 @@ class Agent:
             self.login_pending = True
             self.login_ready = False
             self.login_notice_pending = False
+            self.monitoring_enabled = False
             return
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
@@ -112,10 +117,12 @@ class Agent:
         self.login_pending = True
         self.login_ready = False
         self.login_notice_pending = False
+        self.monitoring_enabled = False
 
     def stop(self) -> None:
         """Pause monitoring but keep the browser and Paychain session open."""
         SIGNAL_PATH.unlink(missing_ok=True)
+        self.monitoring_enabled = False
         self.login_pending = False
         self.login_ready = False
         self.login_notice_pending = False
@@ -134,6 +141,7 @@ class Agent:
         self.login_pending = False
         self.login_ready = False
         self.login_notice_pending = False
+        self.monitoring_enabled = False
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         RUNTIME_SETTINGS_PATH.unlink(missing_ok=True)
@@ -146,7 +154,7 @@ class Agent:
 
     @property
     def running(self) -> bool:
-        return self.process_alive()
+        return self.monitoring_enabled and self.process_alive()
 
     def new_activity(self) -> list[dict[str, str]]:
         if not ACTIVITY_LOG.exists():

@@ -411,6 +411,11 @@ def apply_runtime_settings(settings: Settings, runtime_path: Path | None) -> Set
             updated = replace(updated, minimum_amount_uah=Decimal(str(raw["minimum_amount_uah"])))
         if raw.get("refresh_seconds") is not None:
             updated = replace(updated, refresh_seconds=max(1.0, float(raw["refresh_seconds"])))
+        if updated.minimum_amount_uah != settings.minimum_amount_uah or updated.refresh_seconds != settings.refresh_seconds:
+            activity_log.info(
+                "НАЛАШТУВАННЯ | поріг=%s UAH | оновлення=%s сек",
+                updated.minimum_amount_uah, updated.refresh_seconds,
+            )
         return updated
     except (OSError, ValueError, InvalidOperation, json.JSONDecodeError):
         return settings
