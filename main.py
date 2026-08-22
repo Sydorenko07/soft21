@@ -379,6 +379,22 @@ async def wait_for_rendered_rows(page: Page, expected_count: int = 0, timeout_ms
         await page.wait_for_timeout(100)
 
 
+async def looks_authenticated(page: Page) -> bool:
+    """Recognize the logged-in Paychain shell even when there are no offers."""
+    if "/pay-out" not in page.url.lower():
+        return False
+    try:
+        title = (await page.title()).casefold()
+        if title and "paychain" not in title:
+            return False
+        # Login forms remain visible when the account is not authenticated.
+        if await page.locator("input[type='password'], input[autocomplete='current-password']").count():
+            return False
+        return bool(await page.locator("app-main-layout, app-pay-out, app-header, tbody").count())
+    except Exception:
+        return False
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -673,6 +689,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     if login_signal and (
         await page.locator("tbody tr").count()
         or await page.locator("app-empty-table:visible").count()
+        or await looks_authenticated(page)
     ):
         login_signal.parent.mkdir(parents=True, exist_ok=True)
         login_signal.write_text("ready", encoding="utf-8")
