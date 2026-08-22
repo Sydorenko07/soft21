@@ -400,6 +400,22 @@ async def looks_authenticated(page: Page) -> bool:
         return False
 
 
+def apply_runtime_settings(settings: Settings, runtime_path: Path | None) -> Settings:
+    """Read threshold/refresh changes sent by the Telegram agent."""
+    if not runtime_path or not runtime_path.exists():
+        return settings
+    try:
+        raw = json.loads(runtime_path.read_text(encoding="utf-8"))
+        updated = settings
+        if raw.get("minimum_amount_uah") is not None:
+            updated = replace(updated, minimum_amount_uah=Decimal(str(raw["minimum_amount_uah"])))
+        if raw.get("refresh_seconds") is not None:
+            updated = replace(updated, refresh_seconds=max(1.0, float(raw["refresh_seconds"])))
+        return updated
+    except (OSError, ValueError, InvalidOperation, json.JSONDecodeError):
+        return settings
+
+
 async def page_wait(milliseconds: int) -> None:
     """Small cancellable delay used while Angular replaces table nodes."""
     await asyncio.sleep(milliseconds / 1000)
@@ -646,7 +662,8 @@ async def process_offer_batch(
             seen_in_dry_run.add(offer.offer_id)
 
 async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path | None,
-                         login_signal: Path | None, page: Page, window_id: int) -> None:
+                         login_signal: Path | None, runtime_settings: Path | None,
+                         page: Page, window_id: int) -> None:
     """Один екземпляр моніторингу на окремій сторінці."""
     processed = await load_processed()
     reported = set()
@@ -710,6 +727,7 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
     monitoring_started = False
     while True:
         try:
+            settings = apply_runtime_settings(settings, runtime_settings)
             # The agent pauses monitoring by removing the signal file.  Keep
             # this browser context alive so the Paychain login session stays
             # available for the next Start command.
@@ -793,7 +811,8 @@ async def run_instance(settings: Settings, auto_accept: bool, start_signal: Path
 
 
 async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
-              login_signal: Path | None, minimized: bool, windows: int) -> None:
+              login_signal: Path | None, runtime_settings: Path | None,
+              minimized: bool, windows: int) -> None:
     """Запускає один браузер з кількома сторінками (вікнами)."""
     # Завантажуємо кеш оброблених оферів перед запуском
     await load_processed()
@@ -812,7 +831,7 @@ async def run(settings: Settings, auto_accept: bool, start_signal: Path | None,
         for i in range(windows):
             page = existing_pages[i] if i < len(existing_pages) else await context.new_page()
             task = asyncio.create_task(
-                run_instance(settings, auto_accept, start_signal, login_signal, page, i + 1)
+                run_instance(settings, auto_accept, start_signal, login_signal, runtime_settings, page, i + 1)
             )
             tasks.append(task)
 
@@ -843,6 +862,7 @@ def main() -> None:
     parser.add_argument("--windows", type=int, default=1, help="Кількість одночасних вікон моніторингу (за замовчуванням 1)")
     parser.add_argument("--start-signal", type=Path, help="Файл-сигнал запуску для вікна керування")
     parser.add_argument("--login-signal", type=Path, help="Файл-сигнал успішного входу в Paychain")
+    parser.add_argument("--runtime-settings", type=Path, help="Файл динамічних налаштувань від агента")
     parser.add_argument("--minimized", action="store_true", help="Запустити браузер мінімізованим")
     args = parser.parse_args()
 
@@ -860,7 +880,7 @@ def main() -> None:
         if args.windows < 1:
             raise ValueError("windows має бути >= 1")
 
-        asyncio.run(run(settings, args.auto_accept, args.start_signal, args.login_signal, args.minimized, args.windows))
+        asyncio.run(run(settings, args.auto_accept, args.start_signal, args.login_signal, args.runtime_settings, args.minimized, args.windows))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         logging.error("Конфігурація: %s", error)
         raise SystemExit(2) from error

@@ -20,6 +20,7 @@ HERE = Path(__file__).parent
 CONFIG_PATH = HERE / "agent-config.json"
 SIGNAL_PATH = ROOT / ".start_monitoring.signal"
 LOGIN_SIGNAL_PATH = ROOT / ".paychain_login_ready.signal"
+RUNTIME_SETTINGS_PATH = ROOT / ".paychain_runtime_settings.json"
 ACTIVITY_LOG = ROOT / "logs" / "activity.log"
 DOWNLOAD_CONFIG_PATH = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads" / "agent-config.json"
 PROFILE_DIR = ROOT / ".browser-profile"
@@ -37,6 +38,12 @@ class Agent:
         self.login_notice_pending = False
         self.activity_position = ACTIVITY_LOG.stat().st_size if ACTIVITY_LOG.exists() else 0
 
+    def write_runtime_settings(self) -> None:
+        RUNTIME_SETTINGS_PATH.write_text(
+            json.dumps({"minimum_amount_uah": self.threshold, "refresh_seconds": self.refresh_seconds}),
+            encoding="utf-8",
+        )
+
     def process_alive(self) -> bool:
         """Return true only while the browser-monitor child is really alive."""
         if self.process is None:
@@ -49,12 +56,14 @@ class Agent:
         self.login_notice_pending = False
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
+        RUNTIME_SETTINGS_PATH.unlink(missing_ok=True)
         return False
 
     def start(self, threshold: str, refresh_seconds: str = "2") -> None:
         if self.process_alive():
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
+            self.write_runtime_settings()
             SIGNAL_PATH.write_text("start", encoding="utf-8")
             self.login_pending = False
             self.login_ready = False
@@ -63,20 +72,25 @@ class Agent:
         self.terminate_process()
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
+        self.write_runtime_settings()
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
         self.login_ready = False
         self.login_notice_pending = False
-        self.process = subprocess.Popen(
-            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH), "--minimized"],
-            cwd=ROOT,
-        )
+        command = [
+            str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept",
+            "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds,
+            "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH),
+            "--runtime-settings", str(RUNTIME_SETTINGS_PATH), "--minimized",
+        ]
+        self.process = subprocess.Popen(command, cwd=ROOT)
         SIGNAL_PATH.write_text("start", encoding="utf-8")
 
     def open_login(self, threshold: str, refresh_seconds: str = "2") -> None:
         if self.process_alive():
             self.threshold = threshold
             self.refresh_seconds = refresh_seconds
+            self.write_runtime_settings()
             SIGNAL_PATH.unlink(missing_ok=True)
             LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
             self.login_pending = True
@@ -85,12 +99,16 @@ class Agent:
             return
         self.threshold = threshold
         self.refresh_seconds = refresh_seconds
+        self.write_runtime_settings()
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
-        self.process = subprocess.Popen(
-            [str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept", "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds, "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH)],
-            cwd=ROOT,
-        )
+        command = [
+            str(Path(sys.executable)), str(ROOT / "main.py"), "--auto-accept",
+            "--minimum-amount", threshold, "--refresh-seconds", refresh_seconds,
+            "--start-signal", str(SIGNAL_PATH), "--login-signal", str(LOGIN_SIGNAL_PATH),
+            "--runtime-settings", str(RUNTIME_SETTINGS_PATH),
+        ]
+        self.process = subprocess.Popen(command, cwd=ROOT)
         self.login_pending = True
         self.login_ready = False
         self.login_notice_pending = False
@@ -118,6 +136,7 @@ class Agent:
         self.login_notice_pending = False
         SIGNAL_PATH.unlink(missing_ok=True)
         LOGIN_SIGNAL_PATH.unlink(missing_ok=True)
+        RUNTIME_SETTINGS_PATH.unlink(missing_ok=True)
 
     def clear_paychain_session(self) -> None:
         """Remove the local browser session only on an explicit disconnect."""
@@ -208,9 +227,13 @@ async def run() -> None:
                             if agent.login_pending:
                                 agent.open_login(command["threshold"], command.get("refresh_seconds", "2"))
                             elif agent.running:
-                                agent.start(command["threshold"], command.get("refresh_seconds", "2"))
+                                agent.threshold = command["threshold"]
+                                agent.refresh_seconds = command.get("refresh_seconds", agent.refresh_seconds)
+                                agent.write_runtime_settings()
                             else:
                                 agent.threshold = command["threshold"]
+                                agent.refresh_seconds = command.get("refresh_seconds", agent.refresh_seconds)
+                                agent.write_runtime_settings()
                         elif command["action"] == "disconnect":
                             agent.clear_paychain_session()
                             CONFIG_PATH.unlink(missing_ok=True)
